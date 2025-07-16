@@ -41,7 +41,7 @@ the overlapping mesh.
 
 ## Methodology:
 
-![](Figure1.jpg)
+![](/Figure1.jpg)
 
 **Figure 1.** The canonical holistic morphometric analysis (cHMA)
 process as described by Bachmann et al. (2022). Each of the four steps
