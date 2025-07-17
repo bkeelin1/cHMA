@@ -11,7 +11,7 @@ Note: Please add the Github python script to your Python repository
 first.
 
 ``` python
-!pip install cHMA 
+import cHMA
 ```
 
 ## Summary:
