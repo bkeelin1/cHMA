@@ -190,12 +190,14 @@ an entire cHMA analysis as described above:
 1.  **resample:** Resample all 3D images to the same dimensions, size,
     and spacing.
 
-2.  **cHMA:** Create the canonical bone image.
+2.  **align:** Iteratively align all 3D images in the same orientation. 
 
-3.  **isoHMA:** Conduct Holistic Morphometric Analysis by generating a
+3.  **cHMA:** Create the canonical bone image.
+
+4.  **isoHMA:** Conduct Holistic Morphometric Analysis by generating a
     canonical and isotopological bone meshes.
 
-4.  **smesh:** Assign scalar values to the canonical mesh.
+5.  **smesh:** Assign scalar values to the canonical mesh.
 
 ## resample:
 
@@ -223,10 +225,37 @@ def resample_condyles(input_dir, output_dir, expected_spacing, cores='detect'):
     """
 ```
 
+## align:
+
+``` python
+def cHMA.align(input_dir, output_dir, scale_factor=3, reference_name="reference", cores='detect'):
+    """
+   Iteratively align bone images to the same orientation.
+    
+    Parameters:
+    -----------
+    input_dir : (str)
+        Directory containing filled and trabecular/cortical binary images
+    output_dir : (str)
+        Directory to save output files from the cHMA analysis 
+    scale_factor : (int)
+        Factor by which to reduce image resolution for faster processing (default: 3)
+    reference_name : (str)
+        Name of the reference bone (default: "reference")
+    cores : (int)
+        How many cores should be used. Default is max number of cores - 3.
+    
+    Returns:
+    --------
+    bool: True if successful, False otherwise
+    Resulting files are stored in the output directory
+    """
+```
+
 ## cHMA:
 
 ``` python
-def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_iterations=5, cp=[1,1,1], cores='detect'):
+def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=5, max_iterations=5, cp=[1,1,1], cores='detect'):
     """
     Perform Canonical Holistic Morphometric Analysis (cHMA) on trabecular bone images.
     
@@ -257,7 +286,7 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
 ## isoHMA:
 
 ``` python
-def isohma(input_dir, output_dir, iteration=2, cores = 'detect', reference="reference", method="chma"):
+def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="reference", method="chma"):
     """
     Create a canonical and corresponding isotopological meshes through the Holistic Morphometric Analysis procedure. 
     
@@ -269,6 +298,12 @@ def isohma(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
         Directory to save output files. This should ideally be the same as the input directory.
     iteration : int
         Number of the last iteration from the canonical Holistic Morphometric Analysis desired for analysis.
+    cores: int
+        Number of CPU processor cores you want to use. Use the default if you don't understand this.
+    reference: str
+        The name of the original reference specimen you used in the cHMA function.
+    method: str
+        The method you used to create a canonical image. By default, this is chma. However, more analyses will come in the future (not available now).
         
     Returns:
     --------
@@ -314,7 +349,6 @@ def scalar_mesh(input_file, pc_loadings, output_file, pc_name="PC1"):
 ## **Step 1: Resample all images to same dimensions and size**
 
 ``` python
-# Right Side Resampling
 import cHMA
 import gc
 
@@ -322,10 +356,27 @@ input_dir = "B:/Test"
 output_dir = "B:/Test"
 expected_spacing = [0.06,0.06,0.06]
 
-cHMA.resample(input_dir, output_dir, expected_spacing, cores=28)
+cHMA.resample(input_dir, output_dir, expected_spacing, cores='detect')
 ```
 
-## **Step 2: Create the Canonical Bone with function cHMA**
+## **Step 2: Iteratively align all images using rigid image registration (without scaling)**
+
+``` python
+import cHMA
+import gc
+
+input_dir = "B:/Test"
+output_dir = "B:/Test"
+reference_name = "1"
+
+gc.collect()
+
+cHMA.align(input_dir, output_dir, scale_factor = 5, reference_name = "1", cores='detect')
+
+gc.collect()
+```
+
+## **Step 3: Create the Canonical Bone with function cHMA**
 
 ``` python
 import cHMA 
@@ -352,6 +403,8 @@ gc.collect()
 input_dir = "B:/Test"
 output_dir = "B:/Test"
 cHMA.isoHMA(input_dir, output_dir, iteration=2, cores = 28, reference="1278", method="chma")
+
+gc.collect()
 ```
 
 ## **Step 4: Map Principal Component Extremes from Python (after analysis) to the Canonical Mesh**
@@ -368,7 +421,7 @@ data = [
 ]
 
 # Loop through data and cb together using zip
-for pc_name, cb_folder in zip(data, cb):
+for pc_name in data:
     cHMA.smesh(
         input_file=f"B:/Test/Canonical_Bone/trabecular.vtk",
         pc_loadings=pd.read_csv(f"B:/CResults/{pc_name}.csv")["PC_Loading"].values,
