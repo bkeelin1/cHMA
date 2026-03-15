@@ -1,5 +1,6 @@
 # Canonical Holistic Morphometric Analysis (cHMA)
 # Author: Brian Anthony Keeling
+# Modified: File naming convention updated to use ID.tiff instead of ID_type_resampled.tiff
 
 import os
 import numpy as np
@@ -10,10 +11,12 @@ import traceback
 import time
 import multiprocessing
 import pandas as pd
+import math
 import skimage.measure
 import pyvista as pv
 import skimage.measure
 import vtk
+import re
 import tetgen
 from vtk.util.numpy_support import numpy_to_vtk
 from scipy.spatial.transform import Rotation as R
@@ -31,20 +34,28 @@ from mpl_toolkits.mplot3d import Axes3D
 # Resampling Function
 ###############################
 
-def load_image1(file_path, expected_spacing=(0.06, 0.06, 0.06), pixel_type=sitk.sitkFloat32):
-    """Load an image using SimpleITK, set expected spacing, direction, and origin."""
+def load_image1(file_path, pixel_type=sitk.sitkFloat32):
+    """Load an image and preserve its original spacing."""
     try:
         if not os.path.exists(file_path):
             logging.error(f"File does not exist: {file_path}")
             return None
+
         image = sitk.ReadImage(file_path, pixel_type)
-        image.SetSpacing(expected_spacing)
-        image.SetDirection([1.0, 0.0, 0.0,   # Identity matrix
+
+        # Log the ACTUAL spacing from the file
+        actual_spacing = image.GetSpacing()
+        logging.info(f"Loaded {file_path} with original spacing: {actual_spacing}")
+
+        # Set standard orientation
+        image.SetDirection([1.0, 0.0, 0.0,
                             0.0, 1.0, 0.0,
                             0.0, 0.0, 1.0])
         image.SetOrigin((0.0, 0.0, 0.0))
-        logging.info(f"Loaded image: {file_path} with spacing: {expected_spacing}")
-        image = cleanup1(image)
+
+        # Clean after loading (optional)
+        # image = cleanup1(image)
+
         return image
     except Exception as e:
         logging.error(f"Error loading image {file_path}: {e}")
@@ -140,7 +151,180 @@ def cleanup1(image):
         traceback.print_exc()
         return image  # Return original if cleaning fails
 
-def find_bounding_box(filled_image):
+
+def find_bounding_box(filled_image, padding_mm=10.0):
+    """
+    Finds the bounding box of the non-zero regions with padding to prevent volume loss.
+
+    Parameters:
+    -----------
+    filled_image : sitk.Image
+        Binary filled image
+    padding_mm : float
+        Padding in millimeters to add around the bounding box
+    """
+    try:
+        # Label connected components
+        labeled_mask = sitk.ConnectedComponent(filled_image)
+        stats = sitk.LabelShapeStatisticsImageFilter()
+        stats.Execute(labeled_mask)
+
+        # Check if any labels are present
+        labels = stats.GetLabels()
+        if not labels:
+            logging.warning("No bone regions found in Filled image.")
+            return None
+
+        # Get the largest connected component
+        largest_label = max(labels, key=lambda l: stats.GetPhysicalSize(l))
+        bounding_box = stats.GetBoundingBox(largest_label)
+
+        # Convert padding from mm to voxels
+        spacing = filled_image.GetSpacing()
+        padding_voxels = [int(padding_mm / s + 0.5) for s in spacing]
+
+        # Add padding to bounding box while respecting image boundaries
+        image_size = filled_image.GetSize()
+        padded_box = list(bounding_box)
+
+        # Adjust start indices and sizes with padding
+        for i in range(3):
+            # Lower bound with padding
+            new_start = max(0, bounding_box[i] - padding_voxels[i])
+            # Upper bound with padding
+            new_end = min(image_size[i], bounding_box[i] + bounding_box[3 + i] + padding_voxels[i])
+            # Update box
+            padded_box[i] = new_start
+            padded_box[3 + i] = new_end - new_start
+
+        logging.info(f"Original bounding box: {bounding_box}, Padded: {padded_box}")
+        return tuple(padded_box)
+
+    except Exception as e:
+        logging.error(f"Error finding bounding box: {e}")
+        traceback.print_exc()
+        return None
+
+
+def process_bones(data_dir, target_spacing=(0.06, 0.06, 0.06), padding_mm=10.0):
+    """
+    Processes all Bones: load -> resample to target spacing -> crop -> pad.
+    Preserves physical dimensions during resampling.
+    """
+    try:
+        filled_dir = os.path.join(data_dir, 'Filled')
+        raw_dir = os.path.join(data_dir, 'Raw')
+        cortical_dir = os.path.join(data_dir, 'Cortical')
+        trabecular_dir = os.path.join(data_dir, 'Trabecular')
+
+        for dir_path in [filled_dir, raw_dir, cortical_dir, trabecular_dir]:
+            if not os.path.exists(dir_path):
+                logging.error(f"Required directory '{dir_path}' does not exist.")
+                return {}, [0, 0, 0]
+
+        all_files = os.listdir(filled_dir)
+        bone_files = [f for f in all_files if f.lower().endswith('.tiff') or f.lower().endswith('.tif')]
+
+        if not bone_files:
+            logging.error(f"No .tiff or .tif files found in {filled_dir}")
+            return {}, [0, 0, 0]
+
+        bone_names = [os.path.splitext(f)[0] for f in bone_files]
+        logging.info(f"Found {len(bone_names)} Bones")
+
+        bone_info = {}
+        max_size = [0, 0, 0]
+        processed_count = 0
+
+        for bone, bone_file in zip(bone_names, bone_files):
+            try:
+                filled_path = os.path.join(filled_dir, bone_file)
+
+                # Load with ORIGINAL spacing preserved
+                filled_image = load_image(filled_path)
+                if filled_image is None:
+                    continue
+
+                original_spacing = filled_image.GetSpacing()
+                logging.info(f"{bone}: Original spacing {original_spacing}")
+
+                # NOW resample to target spacing (preserves physical size)
+                filled_image_resampled = resample_image1(filled_image, target_spacing=target_spacing)
+                if filled_image_resampled is None:
+                    continue
+
+                # Verify physical size is preserved
+                orig_phys_size = [filled_image.GetSize()[i] * original_spacing[i] for i in range(3)]
+                new_phys_size = [filled_image_resampled.GetSize()[i] * target_spacing[i] for i in range(3)]
+                logging.info(f"{bone}: Physical size preserved: {orig_phys_size} -> {new_phys_size}")
+
+                # Find bounding box with padding
+                bounding_box = find_bounding_box(filled_image_resampled, padding_mm=padding_mm)
+                if bounding_box is None:
+                    continue
+
+                # Update max size
+                for i in range(3):
+                    if bounding_box[3 + i] > max_size[i]:
+                        max_size[i] = bounding_box[3 + i]
+
+                # Process all stacks
+                cropped_images = {}
+                for stack_name, stack_dir in zip(
+                        ['Raw', 'Cortical', 'Trabecular', 'Filled'],
+                        [raw_dir, cortical_dir, trabecular_dir, filled_dir]
+                ):
+                    stack_files = os.listdir(stack_dir)
+                    matching = [f for f in stack_files if os.path.splitext(f)[0] == bone and
+                                (f.lower().endswith('.tiff') or f.lower().endswith('.tif'))]
+
+                    if not matching:
+                        continue
+
+                    stack_path = os.path.join(stack_dir, matching[0])
+
+                    # Load preserving original spacing
+                    image = load_image(stack_path)
+                    if image is None:
+                        continue
+
+                    # Resample to target spacing
+                    image_resampled = resample_image1(image, target_spacing=target_spacing)
+                    if image_resampled is None:
+                        continue
+
+                    # Crop
+                    cropped_image = crop_image(image_resampled, bounding_box)
+                    if cropped_image is None:
+                        continue
+
+                    cropped_images[stack_name] = cropped_image
+
+                bone_info[bone] = {
+                    'bounding_box': bounding_box,
+                    'cropped_images': cropped_images
+                }
+
+                processed_count += 1
+                logging.info(f"Processed {bone} ({processed_count}/{len(bone_names)})")
+
+                del filled_image, filled_image_resampled, cropped_images
+                gc.collect()
+
+            except Exception as e:
+                logging.error(f"Error processing {bone}: {e}")
+                traceback.print_exc()
+                continue
+
+        logging.info(f"Maximum bounding box: {max_size}")
+        return bone_info, max_size
+
+    except Exception as e:
+        logging.error(f"Error in process_bones: {e}")
+        traceback.print_exc()
+        return {}, [0, 0, 0]
+
+def find_bounding_box67(filled_image):
     """
     Finds the bounding box of the non-zero regions in the Filled binary image.
     """
@@ -231,9 +415,9 @@ def pad_image(image, target_size):
         traceback.print_exc()
         return None
 
-def process_condyles(data_dir, expected_spacing=(0.06,0.06,0.06)):
+def process_bones67(data_dir, expected_spacing=(0.06,0.06,0.06)):
     """
-    Processes all condyles by trimming based on the Filled image bounding box and determining the maximum bounding box size.
+    Processes all Bones by trimming based on the Filled image bounding box and determining the maximum bounding box size.
     """
     try:
         # Define stack directories
@@ -248,38 +432,59 @@ def process_condyles(data_dir, expected_spacing=(0.06,0.06,0.06)):
                 logging.error(f"Required directory '{dir_path}' does not exist.")
                 return {}, [0, 0, 0]
 
-        # List of condyles based on Filled images
-        condyle_files = [f for f in os.listdir(filled_dir) if f.endswith('.tiff') or f.endswith('.tif')]
-        condyle_names = [os.path.splitext(f)[0].replace('_filled_resampled', '') for f in condyle_files]
+        # Check what's actually in the Filled directory
+        all_files = os.listdir(filled_dir)
+        logging.info(f"All files in {filled_dir}: {all_files[:10]}...")  # Show first 10 files
+        
+        # List of Bones based on Filled images - handle case insensitivity
+        bone_files = [f for f in all_files if f.lower().endswith('.tiff') or f.lower().endswith('.tif')]
+        
+        if len(bone_files) == 0:
+            logging.error(f"No .tiff or .tif files found in {filled_dir}")
+            logging.error(f"Directory contains {len(all_files)} files total")
+            # Check if files might have different extensions
+            other_extensions = set([os.path.splitext(f)[1] for f in all_files if os.path.splitext(f)[1]])
+            if other_extensions:
+                logging.error(f"Found files with these extensions: {other_extensions}")
+            return {}, [0, 0, 0]
+        
+        # Extract bone names (just the ID without extension)
+        bone_names = [os.path.splitext(f)[0] for f in bone_files]
 
-        logging.info(f"Found {len(condyle_names)} condyles.")
+        logging.info(f"Found {len(bone_names)} Bones in Filled directory")
+        logging.info(f"bone IDs: {', '.join(bone_names[:10])}...")  # Show first 10
 
-        condyle_info = {}
+        bone_info = {}
         max_size = [0, 0, 0]
+        processed_count = 0
 
         # First Pass: Determine bounding boxes and maximum size
-        for condyle in condyle_names:
+        for bone_idx, (bone, bone_file) in enumerate(zip(bone_names, bone_files)):
             try:
-                filled_path = os.path.join(filled_dir, f"{condyle}_filled_resampled.tiff")
+                # Use the actual filename from the directory
+                filled_path = os.path.join(filled_dir, bone_file)
+                
                 if not os.path.exists(filled_path):
-                    logging.warning(f"'Filled.tiff' not found for {condyle}. Skipping this condyle.")
+                    logging.warning(f"Filled image file not found for {bone} at {filled_path}. This shouldn't happen!")
                     continue
 
+                logging.debug(f"Loading filled image for {bone} from {filled_path}")
+
                 # Load and resample Filled image
-                filled_image = load_image1(filled_path, expected_spacing, pixel_type=sitk.sitkUInt8)
+                filled_image = load_image(filled_path)
                 if filled_image is None:
-                    logging.warning(f"Failed to load Filled image for {condyle}. Skipping.")
+                    logging.warning(f"Failed to load Filled image for {bone}. Skipping.")
                     continue
 
                 filled_image_resampled = resample_image1(filled_image, target_spacing=expected_spacing)
                 if filled_image_resampled is None:
-                    logging.warning(f"Failed to resample Filled image for {condyle}. Skipping.")
+                    logging.warning(f"Failed to resample Filled image for {bone}. Skipping.")
                     continue
 
                 # Find bounding box
                 bounding_box = find_bounding_box(filled_image_resampled)
                 if bounding_box is None:
-                    logging.warning(f"No bone regions detected in {condyle}. Skipping.")
+                    logging.warning(f"No bone regions detected in {bone}. Skipping.")
                     continue
 
                 # Update maximum size
@@ -289,97 +494,242 @@ def process_condyles(data_dir, expected_spacing=(0.06,0.06,0.06)):
 
                 # Load, resample, and crop all image stacks
                 cropped_images = {}
-                for stack_name, suffix, stack_dir, pixel_type in zip(
+                for stack_name, stack_dir, pixel_type in zip(
                     ['Raw', 'Cortical', 'Trabecular', 'Filled'],
-                    ['_raw_resampled', '_cortical_resampled', '_trabecular_resampled', '_filled_resampled'],
                     [raw_dir, cortical_dir, trabecular_dir, filled_dir],
                     [sitk.sitkUInt8, sitk.sitkUInt8, sitk.sitkUInt8, sitk.sitkUInt8]
                 ):
-                    stack_path = os.path.join(stack_dir, f"{condyle}{suffix}.tiff")
-                    if not os.path.exists(stack_path):
-                        logging.warning(f"'{stack_name}.tiff' not found for {condyle}. Skipping this stack.")
+                    # Try to find the file with matching ID in the stack directory
+                    stack_files = os.listdir(stack_dir)
+                    matching_files = [f for f in stack_files if os.path.splitext(f)[0] == bone and
+                                    (f.lower().endswith('.tiff') or f.lower().endswith('.tif'))]
+                    
+                    if not matching_files:
+                        logging.warning(f"'{stack_name}' file not found for {bone} in {stack_dir}. Skipping this stack.")
                         continue
-
-                    image = load_image1(stack_path, expected_spacing, pixel_type=pixel_type)
+                    
+                    stack_path = os.path.join(stack_dir, matching_files[0])
+                    
+                    image = load_image(stack_path)
                     if image is None:
-                        logging.warning(f"Failed to load {stack_name} image for {condyle}. Skipping.")
+                        logging.warning(f"Failed to load {stack_name} image for {bone}. Skipping.")
                         continue
 
                     image_resampled = resample_image1(image, target_spacing=expected_spacing)
                     if image_resampled is None:
-                        logging.warning(f"Failed to resample {stack_name} image for {condyle}. Skipping.")
+                        logging.warning(f"Failed to resample {stack_name} image for {bone}. Skipping.")
                         continue
 
                     cropped_image = crop_image(image_resampled, bounding_box)
                     if cropped_image is None:
-                        logging.warning(f"Failed to crop {stack_name} image for {condyle}. Skipping.")
+                        logging.warning(f"Failed to crop {stack_name} image for {bone}. Skipping.")
                         continue
 
                     cropped_images[stack_name] = cropped_image
 
                 # Store information
-                condyle_info[condyle] = {
+                bone_info[bone] = {
                     'bounding_box': bounding_box,
                     'cropped_images': cropped_images
                 }
 
-                logging.info(f"Processed {condyle}: Bounding box size = {bounding_box[3:]}")
+                processed_count += 1
+                logging.info(f"Successfully processed {bone} ({processed_count}/{len(bone_names)}): Bounding box size = {bounding_box[3:]}")
 
                 # Clean up to save memory
                 del filled_image, filled_image_resampled, cropped_images
                 gc.collect()
 
             except Exception as e:
-                logging.error(f"An error occurred while processing {condyle}: {e}")
+                logging.error(f"An error occurred while processing {bone}: {e}")
                 traceback.print_exc()
-                continue  # Skip to the next condyle
+                continue  # Skip to the next bone
 
-        logging.info(f"Maximum bounding box size across all condyles: {max_size}")
+        logging.info(f"Successfully processed {processed_count} out of {len(bone_names)} Bones")
+        logging.info(f"Maximum bounding box size across all Bones: {max_size}")
 
-        return condyle_info, max_size
+        return bone_info, max_size
 
     except Exception as e:
-        logging.error(f"An unexpected error occurred in process_condyles: {e}")
+        logging.error(f"An unexpected error occurred in process_Bones: {e}")
         traceback.print_exc()
         return {}, [0, 0, 0]
 
-def pad_condyles(condyle_info, max_size):
+def pad_bones(bone_info, max_size):
     """ 
-    Pads each condyle's image stacks to match the maximum bounding box size.
+    Pads each bone's image stacks to match the maximum bounding box size.
     """
     try:
-        padded_condyle_info = {}
+        padded_bone_info = {}
 
-        for condyle, info in condyle_info.items():
+        for bone, info in bone_info.items():
             try:
                 padded_images = {}
                 for stack, image in info['cropped_images'].items():
                     padded_image = pad_image(image, max_size)
                     if padded_image is None:
-                        logging.error(f"Padding failed for {condyle} - {stack}.")
+                        logging.error(f"Padding failed for {bone} - {stack}.")
                         continue
                     padded_images[stack] = padded_image
-                padded_condyle_info[condyle] = padded_images
-                logging.info(f"Padded images for {condyle} to size {max_size}")
+                padded_bone_info[bone] = padded_images
+                logging.info(f"Padded images for {bone} to size {max_size}")
 
                 # Clean up to save memory
                 del info['cropped_images']
                 gc.collect()
 
             except Exception as e:
-                logging.error(f"An error occurred while padding images for {condyle}: {e}")
+                logging.error(f"An error occurred while padding images for {bone}: {e}")
                 traceback.print_exc()
-                continue  # Skip to the next condyle
+                continue  # Skip to the next bone
 
-        return padded_condyle_info
+        return padded_bone_info
     except Exception as e:
-        logging.error(f"An unexpected error occurred in pad_condyles: {e}")
+        logging.error(f"An unexpected error occurred in pad_Bones: {e}")
         traceback.print_exc()
         return {}
 
-def save_processed_condyles(padded_condyle_info, output_dir):
+
+def process_single_bone_aligned(bone, temp_dir, expected_spacing, max_size, output_dir):
+    """
+    Process a single aligned bone: load -> crop -> pad -> save -> cleanup.
+    Memory-efficient approach to avoid RAM exhaustion.
+    """
+    try:
+        # Load filled image first to get bounding box
+        filled_dir = os.path.join(temp_dir, 'Filled')
+        filled_files = os.listdir(filled_dir)
+        matching = [f for f in filled_files if os.path.splitext(f)[0] == bone and
+                    (f.lower().endswith('.tiff') or f.lower().endswith('.tif'))]
+
+        if not matching:
+            logging.warning(f"Filled file not found for {bone}")
+            return False
+
+        filled_path = os.path.join(filled_dir, matching[0])
+        filled_image = load_image(filled_path)
+
+        if filled_image is None:
+            return False
+
+        # Get bounding box
+        bounding_box = find_bounding_box(filled_image)
+        if bounding_box is None:
+            del filled_image
+            return False
+
+        # Process each image type
+        for stack_name in ['Raw', 'Cortical', 'Trabecular', 'Filled']:
+            stack_dir = os.path.join(temp_dir, stack_name)
+            stack_files = os.listdir(stack_dir)
+            matching = [f for f in stack_files if os.path.splitext(f)[0] == bone and
+                        (f.lower().endswith('.tiff') or f.lower().endswith('.tif'))]
+
+            if not matching:
+                logging.warning(f"'{stack_name}' file not found for {bone}. Skipping.")
+                continue
+
+            # Load image
+            stack_path = os.path.join(stack_dir, matching[0])
+
+            if stack_name == 'Filled':
+                image = filled_image  # Reuse
+            else:
+                image = load_image(stack_path, expected_spacing)
+                if image is None:
+                    continue
+
+            # Crop
+            cropped = crop_image(image, bounding_box)
+            if cropped is None:
+                if stack_name != 'Filled':
+                    del image
+                continue
+
+            # Pad
+            padded = pad_image(cropped, max_size)
+            if padded is None:
+                logging.error(f"Padding failed for {bone} - {stack_name}")
+                del cropped
+                if stack_name != 'Filled':
+                    del image
+                continue
+
+            # Save immediately
+            output_path = os.path.join(output_dir, stack_name, f"{bone}.tiff")
+            os.makedirs(os.path.join(output_dir, stack_name), exist_ok=True)
+            sitk.WriteImage(padded, output_path)
+            logging.info(f"Saved '{stack_name}' for {bone}")
+
+            # Cleanup
+            del cropped, padded
+            if stack_name != 'Filled':
+                del image
+            gc.collect()
+
+        # Final cleanup
+        del filled_image
+        gc.collect()
+        return True
+
+    except Exception as e:
+        logging.error(f"Error processing aligned bone {bone}: {e}")
+        traceback.print_exc()
+        return False
+
+
+def determine_max_size_from_aligned(temp_dir, expected_spacing):
+    """
+    Determine maximum bounding box from aligned Filled images.
+    Only loads Filled images temporarily to save memory.
+    """
+    try:
+        filled_dir = os.path.join(temp_dir, 'Filled')
+        filled_files = [f for f in os.listdir(filled_dir)
+                        if f.lower().endswith('.tiff') or f.lower().endswith('.tif')]
+        bone_names = [os.path.splitext(f)[0] for f in filled_files]
+
+        logging.info(f"Determining max bounding box from {len(bone_names)} aligned Bones")
+
+        max_size = [0, 0, 0]
+        valid_bones = []
+
+        for bone, bone_file in zip(bone_names, filled_files):
+            filled_path = os.path.join(filled_dir, bone_file)
+            filled_image = load_image(filled_path)
+
+            if filled_image is None:
+                continue
+
+            bounding_box = find_bounding_box(filled_image)
+
+            if bounding_box is None:
+                del filled_image
+                continue
+
+            # Update max size
+            for i in range(3):
+                if bounding_box[3 + i] > max_size[i]:
+                    max_size[i] = bounding_box[3 + i]
+
+            valid_bones.append(bone)
+
+            # Immediate cleanup
+            del filled_image
+            gc.collect()
+
+        logging.info(f"Maximum bounding box: {max_size}")
+        return max_size, valid_bones
+
+    except Exception as e:
+        logging.error(f"Error determining max size: {e}")
+        traceback.print_exc()
+        return [0, 0, 0], []
+
+def save_processed_bones(padded_bone_info, output_dir):
     """ 
-    Saves the padded image stacks to the specified output directory.    
+    Saves the padded image stacks to the specified output directory.
+    Modified to use ID.tiff naming convention.
     """
     try:
         # Create output subdirectories
@@ -387,19 +737,20 @@ def save_processed_condyles(padded_condyle_info, output_dir):
             stack_output_dir = os.path.join(output_dir, stack)
             os.makedirs(stack_output_dir, exist_ok=True)
 
-        for condyle, images in padded_condyle_info.items():
+        for bone, images in padded_bone_info.items():
             for stack, image in images.items():
-                stack_output_path = os.path.join(output_dir, stack, f"{condyle}_{stack.lower()}_resampled.tiff")
+                # Save with just ID.tiff format
+                stack_output_path = os.path.join(output_dir, stack, f"{bone}.tiff")
                 sitk.WriteImage(image, stack_output_path)
-                logging.info(f"Saved '{stack}.tiff' for {condyle} to '{stack_output_path}'")
+                logging.info(f"Saved '{stack}' for {bone} to '{stack_output_path}'")
 
             # Clean up to save memory
             del images
             gc.collect()
 
-        logging.info(f"All processed condyles saved to '{output_dir}'.")
+        logging.info(f"All processed Bones saved to '{output_dir}'.")
     except Exception as e:
-        logging.error(f"An unexpected error occurred in save_processed_condyles: {e}")
+        logging.error(f"An unexpected error occurred in save_processed_Bones: {e}")
         traceback.print_exc()
 
 def validate_processed_images(output_dir, expected_spacing):
@@ -407,7 +758,6 @@ def validate_processed_images(output_dir, expected_spacing):
     Validates that all processed images have the expected size, spacing, origin, and direction.
     """
     try:
-        #expected_spacing = (0.06, 0.06, 0.06)
         expected_direction = [1.0, 0.0, 0.0,
                               0.0, 1.0, 0.0,
                               0.0, 0.0, 1.0]
@@ -438,7 +788,516 @@ def validate_processed_images(output_dir, expected_spacing):
         logging.error(f"An unexpected error occurred in validate_processed_images: {e}")
         traceback.print_exc()
 
-def resample(input_dir, output_dir, expected_spacing, cores='detect'):
+
+def similarity_to_rigid_transform(similarity_transform):
+    """
+    Extract rigid transform (rotation + translation) from similarity transform.
+    Discards the scale component to preserve original specimen sizes.
+    """
+    try:
+        # Get transformation components
+        center = similarity_transform.GetCenter()
+        translation = similarity_transform.GetTranslation()
+
+        # Get the 3x3 rotation matrix from similarity (includes scale)
+        sim_matrix = np.array(similarity_transform.GetMatrix()).reshape(3, 3)
+
+        # Remove scale by normalizing each column (orthonormalization)
+        # This extracts just the rotation component
+        rotation_matrix = np.zeros((3, 3))
+        for i in range(3):
+            rotation_matrix[:, i] = sim_matrix[:, i] / np.linalg.norm(sim_matrix[:, i])
+
+        # Create rigid transform
+        rigid_transform = sitk.VersorRigid3DTransform()
+        rigid_transform.SetCenter(center)
+        rigid_transform.SetMatrix(rotation_matrix.flatten().tolist())
+        rigid_transform.SetTranslation(translation)
+
+        # Get scale for logging
+        params = similarity_transform.GetParameters()
+        scale = params[0]
+        logging.info(f"Extracted rigid transform (discarded scale: {scale:.4f})")
+
+        return rigid_transform
+
+    except Exception as e:
+        logging.error(f"Error converting similarity to rigid transform: {e}")
+        traceback.print_exc()
+        return None
+
+
+def _recursive_flatten(transform, flat_list):
+    """Recursive helper function to unpack all transforms."""
+    # Check if the transform is a composite by looking for the method
+    if hasattr(transform, 'GetNumberOfTransforms'):
+        for i in range(transform.GetNumberOfTransforms()):
+            # Recursively call on each sub-transform
+            _recursive_flatten(transform.GetTransform(i), flat_list)
+    else:
+        # Base case: it's a simple transform, so add it to our list
+        flat_list.append(transform)
+
+
+def flatten_transform(transform):
+    """
+    Creates a final, flattened composite transform from a potentially nested one.
+    """
+    flat_transform_list = []
+    # Unpack all transforms into a simple Python list
+    _recursive_flatten(transform, flat_transform_list)
+
+    # Create the final, single-level composite transform from the flat list
+    final_flat_transform = sitk.CompositeTransform(3)
+    for tx in flat_transform_list:
+        final_flat_transform.AddTransform(tx)
+
+    return final_flat_transform
+
+def calculate_resample_grid(final_transform, reference_image, moving_image):
+    """
+    Calculates a new image grid that encompasses both the reference and the
+    transformed moving image to prevent clipping.
+    """
+    # Find the 8 corners of the moving image
+    moving_size = moving_image.GetSize()
+    corners = [
+        (0, 0, 0),
+        (moving_size[0], 0, 0),
+        (0, moving_size[1], 0),
+        (0, 0, moving_size[2]),
+        (moving_size[0], moving_size[1], 0),
+        (moving_size[0], 0, moving_size[2]),
+        (0, moving_size[1], moving_size[2]),
+        (moving_size[0], moving_size[1], moving_size[2]),
+    ]
+
+    # Transform each corner point
+    physical_corners = [moving_image.TransformIndexToPhysicalPoint(c) for c in corners]
+    transformed_corners = [final_transform.TransformPoint(pc) for pc in physical_corners]
+
+    # Include the corners of the reference image as well
+    ref_size = reference_image.GetSize()
+    ref_corners_phys = [
+        reference_image.TransformIndexToPhysicalPoint((0, 0, 0)),
+        reference_image.TransformIndexToPhysicalPoint((ref_size[0], ref_size[1], ref_size[2]))
+    ]
+
+    all_corners = transformed_corners + ref_corners_phys
+
+    # Find the min and max coordinates across all corners
+    min_x = min(c[0] for c in all_corners)
+    min_y = min(c[1] for c in all_corners)
+    min_z = min(c[2] for c in all_corners)
+    max_x = max(c[0] for c in all_corners)
+    max_y = max(c[1] for c in all_corners)
+    max_z = max(c[2] for c in all_corners)
+
+    # Define the new grid properties
+    output_spacing = reference_image.GetSpacing()
+    output_origin = [min_x, min_y, min_z]
+    output_size = [
+        int((max_x - min_x) / output_spacing[0]),
+        int((max_y - min_y) / output_spacing[1]),
+        int((max_z - min_z) / output_spacing[2]),
+    ]
+    output_direction = reference_image.GetDirection()
+    return output_size, output_origin, output_spacing, output_direction
+
+
+def align(input_dir, output_dir, reference_name, scale_factor=5, cores='detect'):
+    """
+    Main function to execute bone alignment.
+    Includes an iterative refinement loop to ensure a minimum Dice score.
+    """
+    # Configure logging
+    log_file = os.path.join(output_dir, f"align_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler()]
+    )
+
+    start_time = time.time()
+    logging.info(f"Starting image alignment to reference: {reference_name}")
+
+    # Set the number of threads for SimpleITK
+    if cores == 'detect':
+        num_cores = max(1, multiprocessing.cpu_count() - 2)  # Keep 2 cores free, but use at least 1
+    else:
+        num_cores = int(cores)
+    sitk.ProcessObject_SetGlobalDefaultNumberOfThreads(num_cores)
+    logging.info(f"Using {num_cores} CPU threads for SimpleITK processing")
+
+    try:
+        # Define and check stack directories
+        dir_map = {
+            'Filled': os.path.join(input_dir, 'Filled'),
+            'Raw': os.path.join(input_dir, 'Raw'),
+            'Cortical': os.path.join(input_dir, 'Cortical'),
+            'Trabecular': os.path.join(input_dir, 'Trabecular')
+        }
+        for dir_name, dir_path in dir_map.items():
+            if not os.path.exists(dir_path):
+                logging.error(f"Required directory '{dir_path}' does not exist.")
+                return False
+            logging.info(f"Found image directory: {dir_path}")
+
+        # Load reference image
+        reference_image_path = os.path.join(dir_map['Filled'], f"{reference_name}.tiff")
+        if not os.path.exists(reference_image_path):
+            reference_image_path = os.path.join(dir_map['Filled'], f"{reference_name}.tif")
+
+        reference_image = load_image(reference_image_path)
+        if reference_image is None:
+            logging.error("Failed to load the reference image")
+            return False
+
+        reference_image_rescaled = resample_image(reference_image, scale_factor)
+        if reference_image_rescaled is None:
+            logging.error("Failed to resample reference image")
+            return False
+
+        metrics = {"dice": [], "hd": [], "msd": []}
+
+        bone_files = [f for f in os.listdir(dir_map['Filled']) if f.lower().endswith(('.tiff', '.tif'))]
+        bone_names = [os.path.splitext(f)[0] for f in bone_files]
+        logging.info(f"Found {len(bone_names)} specimens to align.")
+
+        for bone in bone_names:
+            try:
+                logging.info(f"--- Processing {bone} ---")
+
+                moving_image_path = os.path.join(dir_map['Filled'], f"{bone}.tiff")
+                if not os.path.exists(moving_image_path):
+                    moving_image_path = os.path.join(dir_map['Filled'], f"{bone}.tif")
+
+                moving_image = load_image(moving_image_path)
+                if moving_image is None: continue
+
+                moving_image_rescaled = resample_image(moving_image, scale_factor)
+
+                fixed = sitk.Cast(reference_image_rescaled, sitk.sitkFloat32)
+                moving = sitk.Cast(moving_image_rescaled, sitk.sitkFloat32)
+
+                # ============= 1. COARSE ALIGNMENT PROCEDURE =============
+                logging.info(f"Performing initial alignment check for {bone}...")
+
+                # --- Guess 1: Standard Centroid Alignment ---
+                initial_transform_A = sitk.CenteredTransformInitializer(
+                    fixed,
+                    moving,
+                    sitk.Euler3DTransform(),
+                    #sitk.CenteredTransformInitializerFilter.GEOMETRY
+                    sitk.CenteredTransformInitializerFilter.MOMENTS
+                )
+                # --- Guess 2: Flipped Centroid Alignment (180 deg rotation around X-axis) ---
+                rotation_center = initial_transform_A.GetCenter()
+                x_transform = sitk.Euler3DTransform(rotation_center, math.pi, 0, 0)
+                y_transform = sitk.Euler3DTransform(rotation_center, 0, math.pi, 0)
+                z_transform = sitk.Euler3DTransform(rotation_center, 0, 0, math.pi)
+                xyz_transform = sitk.Euler3DTransform(rotation_center, math.pi, math.pi, math.pi)
+
+                xtrans = sitk.CompositeTransform([initial_transform_A, x_transform])
+                ytrans = sitk.CompositeTransform([initial_transform_A, y_transform])
+                ztrans = sitk.CompositeTransform([initial_transform_A, z_transform])
+                xyztrans = sitk.CompositeTransform([initial_transform_A, xyz_transform])
+
+                # --- Run a quick test on both initializations ---
+                metric_values = {}
+                for name, init_tx in [("Standard", initial_transform_A), ("X-Rotation", xtrans), ("Y-Rotation", ytrans), ("Z-Rotation", ztrans), ("XYZ-Rotation",xyztrans)]:
+                    quick_reg = sitk.ImageRegistrationMethod()
+                    quick_reg.SetMetricAsMeanSquares()
+                    #quick_reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+                    quick_reg.SetInterpolator(sitk.sitkLinear)
+                    quick_reg.SetOptimizerAsRegularStepGradientDescent(learningRate=1.0,
+                                                                       numberOfIterations=50,
+                                                                       minStep=1e-4)
+                    quick_reg.SetInitialTransform(init_tx)
+                    quick_reg.Execute(fixed, moving)
+                    metric_values[name] = quick_reg.GetMetricValue()
+
+                # --- Choose the best initial transform ---
+                best_initial_name = min(metric_values, key=metric_values.get)
+
+                if best_initial_name == "Standard":
+                    initial_transform = initial_transform_A
+                else:
+                    if best_initial_name == "X-Rotation":
+                        initial_transform = x_transform
+                    if best_initial_name == "Y-Rotation":
+                        initial_transform = y_transform
+                    if best_initial_name == "Z-Rotation":
+                        initial_transform = z_transform
+                    if best_initial_name == "XYZ-Rotation":
+                        initial_transform = xyz_transform
+                logging.info(
+                    f"Chose '{best_initial_name}' initialization (Metric: {metric_values[best_initial_name]:.4f})"
+                )
+
+                # ============= 2. FINE ALIGNMENT: ITERATIVE REFINEMENT LOOP =============
+                max_attempts = 3
+                dice_threshold = 0.5
+                current_transform = initial_transform
+                final_transform = initial_transform
+                best_dice_so_far = -1.0
+
+                logging.info(f"Starting iterative refinement for {bone} (goal: Dice >= {dice_threshold})...")
+
+                for attempt in range(max_attempts):
+                    logging.info(f"--- Attempt {attempt + 1} of {max_attempts} ---")
+
+                    # Use a Mask
+                    #fixed_mask = fill(fixed)
+                    # fixed_image = sitk.Mask(fixed, fixed_mask)
+                    #moving_mask = fill(moving)
+                    # moving_image = sitk.Mask(moving_image, moving_mask)
+                    #fixed = sitk.Cast(fixed_mask, sitk.sitkFloat32)
+                    #moving = sitk.Cast(moving_mask, sitk.sitkFloat32)
+
+                    registration_method = sitk.ImageRegistrationMethod()
+                    registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
+                    registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
+                    registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+
+                    sampling_percentage = min(0.05 + (attempt * 0.1), 1.0)
+                    registration_method.SetMetricAsMeanSquares()
+                    #registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+                    registration_method.SetMetricSamplingStrategy(registration_method.RANDOM)
+                    registration_method.SetMetricSamplingPercentage(sampling_percentage)
+
+                    #registration_method.SetMetricFixedMask(fixed)
+                    logging.info(f"Using sampling percentage: {sampling_percentage * 100:.1f}%")
+
+                    registration_method.SetInterpolator(sitk.sitkLinear)
+
+                    # *** OPTIMIZER IMPROVEMENT: Auto-estimate learning rate ***
+                    registration_method.SetOptimizerAsRegularStepGradientDescent(
+                        learningRate=1.0,
+                        minStep=1e-4,
+                        numberOfIterations=250,
+                        relaxationFactor=0.5,
+                        estimateLearningRate=registration_method.EachIteration
+                    )
+                    registration_method.SetOptimizerScalesFromPhysicalShift()
+                    registration_method.SetInitialTransform(current_transform, inPlace=True)
+
+                    current_transform = registration_method.Execute(fixed, moving)
+
+                    moving_image_full = load_image(os.path.join(dir_map['Filled'], f"{bone}.tiff"))
+                    transformed_image_check = sitk.Resample(
+                        moving_image_full, reference_image, current_transform,
+                        sitk.sitkLinear, 0.0, moving_image_full.GetPixelID()
+                    )
+                    dice, _, _ = compute_metrics(transformed_image_check, reference_image)
+                    logging.info(f"Attempt {attempt + 1} Dice: {dice:.4f}")
+
+                    if dice > best_dice_so_far:
+                        best_dice_so_far = dice
+                        final_transform = sitk.Transform(current_transform)
+
+                    if dice >= dice_threshold:
+                        logging.info(f"Success! Dice score of {dice:.4f} meets the threshold.")
+                        break
+                else:
+                    logging.warning(
+                        f"Failed to meet Dice threshold for {bone} after {max_attempts} attempts. Best score was {best_dice_so_far:.4f}. Using the best transform found.")
+
+                # ============= 3. FLATTEN, APPLY FINAL TRANSFORM, AND SAVE =============
+
+                final_transform_flat = flatten_transform(final_transform)
+
+                logging.info(f"Applying final transform (Dice: {best_dice_so_far:.4f}) to all image types...")
+                transform_dir = os.path.join(output_dir, "Alignment", "Transforms")
+                os.makedirs(transform_dir, exist_ok=True)
+                sitk.WriteTransform(final_transform_flat, os.path.join(transform_dir, f"{bone}.tfm"))
+
+                for dir_name, dir_path in dir_map.items():
+                    full_res_path = os.path.join(dir_path, f"{bone}.tiff")
+                    if not os.path.exists(full_res_path):
+                        full_res_path = os.path.join(dir_path, f"{bone}.tif")
+                    if not os.path.exists(full_res_path): continue
+
+                    moving_image_full = load_image(full_res_path)
+                    transformed_image = sitk.Resample(
+                        moving_image_full, reference_image, final_transform_flat,
+                        sitk.sitkLinear, 0.0, moving_image_full.GetPixelID()
+                    )
+
+                    if dir_name == 'Filled':
+                        dice, hd, msd = compute_metrics(transformed_image, reference_image)
+                        if dice is not None:
+                            metrics["dice"].append(dice);
+                            metrics["hd"].append(hd);
+                            metrics["msd"].append(msd)
+                            logging.info(f"Final metrics for {bone}: Dice={dice:.4f}, HD={hd:.4f}, MSD={msd:.4f}")
+
+                    output_subdir = os.path.join(output_dir, "Alignment", dir_name)
+                    os.makedirs(output_subdir, exist_ok=True)
+                    sitk.WriteImage(transformed_image, os.path.join(output_subdir, f"{bone}.tiff"))
+
+                logging.info(f"Successfully aligned and saved all types for {bone}")
+                gc.collect()
+
+            except Exception as e:
+                logging.error(f"Error processing {bone}: {e}")
+                traceback.print_exc()
+
+        if metrics["dice"]:
+            avg_dice = np.mean(metrics["dice"]);
+            avg_hd = np.mean(metrics["hd"]);
+            avg_msd = np.mean(metrics["msd"])
+            logging.info(f"\n--- Alignment Summary ---\n"
+                         f"Average Metrics: Dice={avg_dice:.4f}, HD={avg_hd:.4f}, MSD={avg_msd:.4f}\n")
+        else:
+            logging.warning("No metrics were computed.")
+
+        logging.info(f"Alignment complete. Total time: {(time.time() - start_time):.2f} seconds")
+        return
+    except Exception as e:
+        logging.error(f"A critical error occurred in the alignment script: {e}")
+        traceback.print_exc()
+        return False
+
+def create_bone_mask(image, threshold=None):
+    """Create binary mask of bone from grayscale image"""
+    if threshold is None:
+        # Auto-threshold using Otsu
+        otsu_filter = sitk.OtsuThresholdImageFilter()
+        otsu_filter.Execute(image)
+        threshold = otsu_filter.GetThreshold()
+
+    mask = sitk.BinaryThreshold(image, lowerThreshold=threshold)
+
+    # Optional: morphological operations to clean up mask
+    mask = sitk.BinaryMorphologicalClosing(mask, [3, 3, 3])
+    mask = sitk.BinaryFillhole(mask)
+
+    return mask
+
+def compute_center_of_mass(mask):
+    """
+    Compute the center of mass (centroid) of a binary mask in physical coordinates
+    """
+    # Get the label statistics to compute center of mass
+    label_stats = sitk.LabelShapeStatisticsImageFilter()
+    label_stats.Execute(mask)
+
+    # Get centroid in physical coordinates (assumes label 1 for the bone)
+    if label_stats.GetNumberOfLabels() > 0:
+        centroid = label_stats.GetCentroid(1)
+        return centroid
+    else:
+        # Fallback: compute from array
+        mask_array = sitk.GetArrayFromImage(mask)
+        coords = np.argwhere(mask_array > 0)
+
+        if len(coords) == 0:
+            logging.warning("Empty mask - using image center")
+            return mask.TransformContinuousIndexToPhysicalPoint(
+                [(sz - 1) / 2.0 for sz in mask.GetSize()]
+            )
+
+        # Compute center of mass in index coordinates
+        com_index = coords.mean(axis=0)
+        # Convert from numpy array order (z,y,x) to ITK order (x,y,z)
+        com_index_itk = [float(com_index[2]), float(com_index[1]), float(com_index[0])]
+
+        # Convert to physical coordinates
+        com_physical = mask.TransformContinuousIndexToPhysicalPoint(com_index_itk)
+        return com_physical
+
+def resample(input_dir, output_dir, expected_spacing, reference_name, cores='detect', padding=10):
+    """
+    Main function to execute the alignment, trimming, and padding pipeline.
+    Uses iterative similarity registration (rigid component only) for alignment.
+    """
+    # Configure logging
+    log_file = os.path.join(output_dir, f"resample_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler()]
+    )
+
+    start_time = time.time()
+    logging.info(f"Starting image resampling and alignment to reference: {reference_name}")
+
+    # Set the number of threads for SimpleITK
+    if cores == 'detect':
+        num_cores = multiprocessing.cpu_count() - 4
+    else:
+        num_cores = cores
+    sitk.ProcessObject_SetGlobalDefaultNumberOfThreads(num_cores)
+    logging.info(f"Using {num_cores} CPU threads for SimpleITK processing")
+
+    try:
+        # Define stack directories
+        filled_dir = os.path.join(input_dir, 'Filled')
+        raw_dir = os.path.join(input_dir, 'Raw')
+        cortical_dir = os.path.join(input_dir, 'Cortical')
+        trabecular_dir = os.path.join(input_dir, 'Trabecular')
+
+        # Ensure all directories exist
+        for dir_path in [filled_dir, raw_dir, cortical_dir, trabecular_dir]:
+            if not os.path.exists(dir_path):
+                logging.error(f"Required directory '{dir_path}' does not exist.")
+                return
+
+        # Create temporary directory
+        temp_dir = os.path.join(output_dir, 'temp_aligned')
+        os.makedirs(temp_dir, exist_ok=True)
+
+
+        # =========================================================================
+        # Resample all images to the same dimensions and spacing
+        # =========================================================================
+        try:
+            # Define your data directories here
+            logging.info("Starting the Resampling Procedure.")
+
+            # Step 1: Process Bones to Trim Based on Filled Image
+            bone_info, max_size = process_bones(input_dir, expected_spacing, padding_mm=padding)
+
+            if not bone_info:
+                logging.error("No Bones were processed. Exiting pipeline.")
+                return
+
+            # Step 2: Pad Each bone's Image Stacks to Match Maximum Size
+            padded_bone_info = pad_bones(bone_info, max_size)
+
+            if not padded_bone_info:
+                logging.error("Padding failed for all Bones. Exiting pipeline.")
+                return
+
+            # Step 3: Save the Processed and Padded Image Stacks
+            save_processed_bones(padded_bone_info, input_dir)
+
+            # Step 4: Validate the Processed Images
+            # validate_processed_images(output_dir, expected_spacing)
+
+            logging.info("Original images were resampled, trimmed, and padded. Continuing....")
+            logging.info(f"Processed images are available at '{input_dir}'.")
+
+        except Exception as e:
+            logging.error(f"An unexpected error occurred in main: {e}")
+            traceback.print_exc()
+
+        # Clean up
+        import shutil
+        shutil.rmtree(temp_dir)
+        logging.info("Cleaned up temporary files")
+
+        end_time = time.time()
+        total_time = end_time - start_time
+        logging.info(f"Completed in {total_time / 60:.2f} minutes")
+        gc.collect()
+
+    except Exception as e:
+        logging.error(f"Error in resample: {e}")
+        traceback.print_exc()
+
+def resample67(input_dir, output_dir, expected_spacing, cores='detect'):
     """
     Main function to execute the trimming and padding pipeline.
     """
@@ -478,22 +1337,22 @@ def resample(input_dir, output_dir, expected_spacing, cores='detect'):
         # Define your data directories here
         logging.info("Starting the trimming and padding pipeline.")
 
-        # Step 1: Process Condyles to Trim Based on Filled Image
-        condyle_info, max_size = process_condyles(input_dir, expected_spacing)
+        # Step 1: Process Bones to Trim Based on Filled Image
+        bone_info, max_size = process_bones(input_dir, expected_spacing)
 
-        if not condyle_info:
-            logging.error("No condyles were processed. Exiting pipeline.")
+        if not bone_info:
+            logging.error("No Bones were processed. Exiting pipeline.")
             return
 
-        # Step 2: Pad Each Condyle's Image Stacks to Match Maximum Size
-        padded_condyle_info = pad_condyles(condyle_info, max_size)
+        # Step 2: Pad Each bone's Image Stacks to Match Maximum Size
+        padded_bone_info = pad_bones(bone_info, max_size)
 
-        if not padded_condyle_info:
-            logging.error("Padding failed for all condyles. Exiting pipeline.")
+        if not padded_bone_info:
+            logging.error("Padding failed for all Bones. Exiting pipeline.")
             return
 
         # Step 3: Save the Processed and Padded Image Stacks
-        save_processed_condyles(padded_condyle_info, output_dir)
+        save_processed_bones(padded_bone_info, output_dir)
 
         # Step 4: Validate the Processed Images
         #validate_processed_images(output_dir, expected_spacing)
@@ -652,42 +1511,42 @@ def cleanup(image):
         traceback.print_exc()
         return image  # Return original if cleaning fails
 
-def fill(binary_image_sitk, radius_mm=2.5):
 
-    from scipy import ndimage
-    """Fill small holes in a binary image using morphological closing.
-    
+def fill(binary_image_sitk, radius_mm=2.5):
+    """
+    Fills small holes in a binary image using SimpleITK's memory-efficient
+    morphological closing operation.
+
     Args:
         binary_image_sitk (sitk.Image): Input binary image (1s and 0s).
-        radius_mm (float): Radius in millimeters for closing operation.
-    
+        radius_mm (float): Radius in millimeters for the closing operation.
+
     Returns:
         sitk.Image: Binary image after morphological closing.
     """
-    # Get voxel spacing from input image
+    # Get voxel spacing to convert physical radius to pixel/voxel radius
     spacing = binary_image_sitk.GetSpacing()
 
-    # Convert mm radius to voxel units
+    # Convert the radius from millimeters to voxel units for each dimension
     radius_voxels = [int(radius_mm / s + 0.5) for s in spacing]
-    
-    # Convert image to numpy array
-    array = sitk.GetArrayFromImage(binary_image_sitk).astype(np.uint8)
-    
-    # Create spherical structuring element
-    struct = ndimage.generate_binary_structure(3, 1)
-    struct = ndimage.iterate_structure(struct, max(radius_voxels))
-    
-    # Perform morphological closing (dilate + erode)
-    closed = ndimage.binary_closing(array, structure=struct).astype(np.uint8)
-    
-    # Convert back to SimpleITK image
-    filled_image = sitk.GetImageFromArray(closed)
-    filled_image.CopyInformation(binary_image_sitk)  # Preserve spacing/origin/direction
+
+    # Create the closing filter directly from SimpleITK
+    closing_filter = sitk.BinaryMorphologicalClosingImageFilter()
+
+    # Set the size of the kernel using the radius in voxels
+    closing_filter.SetKernelRadius(radius_voxels)
+
+    # Set the value in the image that represents the "foreground" to be closed
+    closing_filter.SetForegroundValue(1)
+
+    # Execute the highly optimized filter
+    filled_image = closing_filter.Execute(binary_image_sitk)
+
     return filled_image
 
-def prepare_condyle_image(image):
+def prepare_bone_image(image):
     """
-    Process condyle images by removing background noise and normalizing values.
+    Process bone images by removing background noise and normalizing values.
     """
     try:
         # Get basic statistics
@@ -738,7 +1597,7 @@ def prepare_condyle_image(image):
         return masked_image
         
     except Exception as e:
-        logging.error(f"Error in prepare_condyle_image: {e}")
+        logging.error(f"Error in prepare_bone_image: {e}")
         traceback.print_exc()
         return image
 
@@ -867,13 +1726,27 @@ def similarity_registration(fixed_image, moving_image):
         # Configure registration
         registration_method = sitk.ImageRegistrationMethod()
         registration_method.SetMetricAsCorrelation()
-        registration_method.SetInterpolator(sitk.sitkNearestNeighbor)
+        #registration_method.SetMetricAsMeanSquares()
+        #registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+        registration_method.SetInterpolator(sitk.sitkLinear)
+        registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
+        registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
+        registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+        registration_method.SetOptimizerScalesFromPhysicalShift()
         registration_method.SetInitialTransform(initial_transform, inPlace=True)
         
         # Simplified optimizer settings
-        registration_method.SetOptimizerAsGradientDescent(
-            learningRate=0.9,
-            numberOfIterations=100
+        #registration_method.SetOptimizerAsGradientDescent(
+        #    learningRate=1.0,
+        #    numberOfIterations=100
+        #)
+
+        registration_method.SetOptimizerAsRegularStepGradientDescent(
+            learningRate=1.0,
+            minStep=1e-4,
+            numberOfIterations=100,
+            relaxationFactor=0.5,
+            estimateLearningRate=registration_method.EachIteration
         )
         
         # Execute registration
@@ -1007,7 +1880,255 @@ def compute_average_transform(transforms, fixed_center):
         traceback.print_exc()
         return None
 
-def average_images(image_list, method=2):
+def calculate_volume(image, threshold=0):
+    """Calculates the volume by counting voxels above a given threshold."""
+    # The volume is the number of non-zero voxels.
+    voxel_array = sitk.GetArrayViewFromImage(image)
+    return np.sum(voxel_array > threshold)
+
+
+def canonical_trabecular(Canonical_Bone, Averaged_Trabecular, output_path="trabecular.tiff"):
+    """
+    Generates a canonical trabecular bone network from two inputs.
+    :param Canonical_Bone The path location of the Canonical Bone (cortical + trabecular)
+    :param Averaged_Trabecular The path location of the Averaged Trabecular bone post BSpline Deformation
+    :param output_path The path location for the output files: a solid trabecular bone and the canonical bone
+    """
+    logging.info("Loading Image Volumes")
+    # Load the 3D images
+    avg_bone_vol = load_image(Canonical_Bone)
+    avg_bone_vol = sitk.Cast(avg_bone_vol, sitk.sitkUInt8)
+
+    messy_trab_vol = load_image(Averaged_Trabecular)
+    messy_trab_vol = sitk.Cast(messy_trab_vol, sitk.sitkUInt8)
+
+    # ---------------------------------------------------------
+    # STEP 1: Process the Canonically Averaged Bone Input
+    # ---------------------------------------------------------
+    logging.info("Segmenting The Canonical Bone")
+    # Create the initial bone segment using a threshold of > 5
+    bone = avg_bone_vol > 5
+
+    logging.info("Solidifying Canonical Bone...")
+    closed_bone = sitk.BinaryMorphologicalClosing(bone, [5, 5, 5], sitk.sitkBall)
+    total_volume = sitk.BinaryFillhole(closed_bone, fullyConnected=True)
+
+    # ---------------------------------------------------------
+    # STEP 2: Segment Medullary Area
+    # ---------------------------------------------------------
+
+    logging.info("Segmenting the Medullary Area of Bone")
+    # Pores = Total Volume minus Bone
+    pores = total_volume & ~bone
+
+    # Fill porous region
+    closed_pores = sitk.BinaryMorphologicalClosing(pores, [5,5,5], sitk.sitkBall)
+    filled_pores = sitk.BinaryFillhole(closed_pores, fullyConnected=True)
+
+    # Remove small islands from the filled pores (minimum size 500 voxels)
+    filled_pores_array = sitk.GetArrayFromImage(filled_pores).astype(bool)
+    cleaned_pores_array = morphology.remove_small_objects(filled_pores_array, min_size=500)
+    cleaned_pores = sitk.GetImageFromArray(cleaned_pores_array.astype(np.uint8))
+    cleaned_pores.CopyInformation(filled_pores)
+
+    # ---------------------------------------------------------
+    # STEP 3: Conduct Trabecular Segmentation
+    # ---------------------------------------------------------
+    logging.info("Segmenting the Canonical Trabecular Bone")
+
+    messy_trabecular_mask = messy_trab_vol > 1
+
+    # Intersect the messy trabecular bone with the cleaned pore network mask
+    trabecular = messy_trabecular_mask & cleaned_pores
+    trabecular = trabecular * 255
+
+    Filled = sitk.Cast(trabecular, sitk.sitkUInt8)
+    Filled = Filled > 0
+    trabecular_filled = sitk.BinaryMorphologicalClosing(Filled, [10, 10, 10], sitk.sitkBall)
+    trabecular_filled = sitk.BinaryFillhole(trabecular_filled, fullyConnected=True)
+    #trabecular_filled = trabecular_filled * 255
+    # ---------------------------------------------------------
+    # STEP 4: Save the Output
+    # ---------------------------------------------------------
+    trabecular = sitk.Cast(trabecular, sitk.sitkUInt8)
+    trabecular_filled = sitk.Cast(trabecular_filled, sitk.sitkUInt8)
+    sitk.WriteImage(trabecular_filled, output_path)
+
+    canonical_path = os.path.dirname(output_path)
+    new_path = os.path.join(canonical_path, "Canonical_Trabecular_Image.tiff")
+    sitk.WriteImage(trabecular, new_path)
+
+    logging.info(f"Saved Canonical Trabecular Bone to {new_path}...")
+    logging.info(f"Saved isoHMA Function Ready Trabecular Bone to {output_path}...")
+
+    return None
+
+def average(input_dir, output_path, file_extension=".tiff"):
+    """
+    Loads images, computes the average/median using the average_images
+    function, and saves the result.
+    """
+    try:
+        image_files = [f for f in os.listdir(input_dir) if f.endswith(file_extension)]
+        if not image_files:
+            print(f"Error: No files with extension '{file_extension}' found in '{input_dir}'.")
+            return
+    except FileNotFoundError:
+        print(f"Error: The directory '{input_dir}' was not found.")
+        return
+
+    image_paths = [os.path.join(input_dir, f) for f in image_files]
+    num_images = len(image_paths)
+    print(f"Found {num_images} images to process.")
+
+    # Create a list to hold the SimpleITK image objects
+    image_list = []
+
+    # Loop through all images and read them into the list
+    for path in image_paths:
+        print(f"Loading: {os.path.basename(path)}")
+        img = load_image(path)
+        img = sitk.Cast(img, sitk.sitkUInt8)
+        image_list.append(img)
+
+    # Pass the list of SITK images to the processing function
+    averaged_image = average_images(image_list)
+
+    # Check that the processing function returned a valid image before saving
+    if averaged_image:
+        print(f"Saving final image to: {output_path}")
+        sitk.WriteImage(averaged_image, output_path)
+        print("Done!")
+    else:
+        print("Error: Image processing failed and returned an empty result. Nothing was saved.")
+
+def average_images(image_list):
+    """
+    Automatically tests multiple averaging methods on a list of registered SimpleITK images,
+    and selects the optimal result based on volume preservation.
+
+    The function iterates through three predefined averaging pipelines. For each, it
+    computes the volume of the resulting averaged image. The "best" method is chosen
+    based on the following criteria:
+    1. It must produce an image with a volume smaller than the reference (first) image.
+    2. Among all methods that meet criterion #1, it should NOT be the one with the
+       largest resulting volume (i.e., it picks the second-largest volume). This avoids
+       the most aggressive averaging while still ensuring some consolidation of the shape.
+
+    Args:
+        image_list (list): A list of registered SimpleITK.Image objects.
+
+    Returns:
+        SimpleITK.Image: The optimally averaged image, or None if no suitable
+                         average could be created.
+    """
+    try:
+        # 1. Validate Input Images
+        if not image_list:
+            print("Error: Input image list is empty.")
+            return None
+
+        # Filter out invalid or empty images
+        valid_images = []
+        for img in image_list:
+            if img and sitk.GetArrayViewFromImage(img).any():
+                valid_images.append(img)
+
+        if not valid_images:
+            print("Error: No valid images found in the input list.")
+            return None
+
+        # 2. Prepare Data and Reference
+        reference_image = valid_images[0]
+        original_volume = calculate_volume(reference_image)
+
+        # Convert all images to a stacked NumPy array for efficient processing
+        arrays = [sitk.GetArrayFromImage(img) for img in valid_images]
+        stacked_arrays = np.stack(arrays, axis=0)
+        del arrays, valid_images, image_list  # Free up memory
+        gc.collect()
+
+        # 3. Iterate Through Averaging Methods
+        results = []
+        print("\n--- Testing Averaging Methods ---")
+
+        avg_mean = np.mean(stacked_arrays, axis=0)
+        avg_mean = sitk.GetImageFromArray(avg_mean)
+        avg_mean.CopyInformation(reference_image)
+
+        avg_median = np.median(stacked_arrays, axis=0)
+        avg_median = sitk.GetImageFromArray(avg_median)
+        avg_median.CopyInformation(reference_image)
+
+        for method_id in [1, 2, 3, 4, 5, 6, 7]:
+
+            # --- Method-Specific Averaging ---
+
+            if method_id == 1:
+                # Mean
+                processed_image = avg_mean
+            elif method_id == 2:
+                # Median
+                processed_image = avg_median
+
+            elif method_id == 3:
+                # Median + Median Filter
+                processed_image = sitk.Median(avg_median)
+
+            elif method_id == 4:
+                # Median + Mean Filter
+                processed_image = sitk.Mean(avg_median)
+
+            elif method_id == 5:
+                # Mean + Mean Filter
+                processed_image = sitk.Mean(avg_mean)
+
+            elif method_id == 6:
+                # Mean + Median Filter
+                processed_image = sitk.Median(avg_mean)
+
+            elif method_id == 7:
+                # Median + Mean Filter + Median Filter
+                temp_image = sitk.Mean(avg_median)
+                processed_image = sitk.Median(temp_image)
+
+            # --- Common Cleaning Pipeline for All Methods ---
+            #cleaned_image = prepare_bone_image(processed_image)
+            #cleaned_image = clean_intensity_image(cleaned_image)
+            final_image = sitk.Cast(processed_image, sitk.sitkUInt8)
+
+            # final_image = fill(cleaned_image)
+
+            # --- Evaluate and Store Result ---
+            current_volume = calculate_volume(final_image)
+            results.append({
+                'method': method_id,
+                'volume': current_volume,
+                'image': final_image
+            })
+
+        # 4. Select the Best Method Based on Your Criteria
+        print("\n--- Selecting Optimal Result ---")
+
+        # Sort the valid results by volume in descending order
+        results.sort(key=lambda x: x['volume'], reverse=True)
+
+        # Choose the result that is not the largest
+        if len(results) > 1:
+            best_result = results[1]
+            print(f"Selected Method {best_result['method']} (Largest volume).")
+        else:
+            best_result = results[1]
+        del results
+        gc.collect()
+        return best_result['image']
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        traceback.print_exc()
+        return None
+
+def average_images1(image_list, method=2):
     try:
         if not image_list:
             logging.error("No images provided for averaging.")
@@ -1096,7 +2217,7 @@ def average_images(image_list, method=2):
             avg_image = averager.Execute(avg_image)
         
         # clean the resultant image
-        avg_image = prepare_condyle_image(avg_image)
+        avg_image = prepare_bone_image(avg_image)
         avg_image = clean_intensity_image(avg_image)
         avg_mask = fill(avg_image)
         avg_mask = sitk.Mask(avg_image, avg_mask)
@@ -1138,24 +2259,26 @@ def apply_inverse_transform(image, transform):
         traceback.print_exc()
         return None
 
-def bspline_registration(fixed_image, moving_image, control_point_grid=[1.5, 1.5, 1.5], scale_factor=5):
-    """Perform B-spline registration with conservative parameters to avoid unrealistic deformations."""
+def bspline_registration(fixed_image, moving_image, control_point_grid=[2, 2, 2], scale_factor=5):
+    """Perform B-spline registration."""
     try:
         logging.info("Starting B-spline registration.")
 
         # Convert images to float for registration
-        #fixed_image = prepare_condyle_image(fixed_image)
-        #fixed_image = clean_intensity_image(fixed_image)
-        fixed_mask = fill(fixed_image)
-        fixed_reg = sitk.Mask(fixed_image, fixed_mask)
+        #fixed_mask = fill(fixed_image)
+        #fixed_reg = sitk.Mask(fixed_image, fixed_mask)
 
-        #moving_image = prepare_condyle_image(moving_image)
-        #moving_image = clean_intensity_image(moving_image)
-        moving_mask = fill(moving_image)
-        moving_image = sitk.Mask(moving_image, moving_mask)
+        #moving_mask = fill(moving_image)
+        #moving_reg = sitk.Mask(moving_image, moving_mask)
         
-        fixed_image = sitk.Cast(fixed_mask, sitk.sitkFloat32)
-        moving_image = sitk.Cast(moving_mask, sitk.sitkFloat32)
+        fixed_image = sitk.Cast(fixed_image, sitk.sitkFloat32)
+        moving_image = sitk.Cast(moving_image, sitk.sitkFloat32)
+
+        #gaussian = sitk.SmoothingRecursiveGaussianImageFilter()
+        #gaus_kernal = control_point_grid[0]
+        #gaussian.SetSigma(gaus_kernal)
+        #fixed_image = gaussian.Execute(fixed_image)
+        #moving_image = gaussian.Execute(moving_image)
         
         # Calculate mesh size based on image physical dimensions
         image_physical_size = [
@@ -1189,39 +2312,25 @@ def bspline_registration(fixed_image, moving_image, control_point_grid=[1.5, 1.5
         registration_method.SetMetricAsCorrelation()
         #registration_method.SetMetricAsMeanSquares()
         #registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
-        #registration_method.SetMetricAsANTSNeighborhoodCorrelation(radius=2)
         registration_method.SetMetricSamplingStrategy(registration_method.RANDOM)
-        registration_method.SetMetricSamplingPercentage(0.75)
-        
-        #registration_method.SetMetricFixedMask(fixed_image)
+        registration_method.SetMetricSamplingPercentage(0.15)
+        #registration_method.SetMetricSamplingStrategy(registration_method.REGULAR)
 
         # Use Nearest Neighbor Interpolation
         registration_method.SetInterpolator(sitk.sitkBSpline)
-        
-        # Add transform constraints to prevent extreme deformations
-        #registration_method.SetOptimizerAsLBFGSB(
-        #    gradientConvergenceTolerance=1e-9,
-        #    numberOfIterations=100, 
-        #    maximumNumberOfCorrections=25,
-        #    maximumNumberOfFunctionEvaluations=2500,
-        #    costFunctionConvergenceFactor=1e+8
-        #) 
 
-        registration_method.SetOptimizerAsLBFGS2(solutionAccuracy=1e-4, numberOfIterations=150, deltaConvergenceTolerance=0.01)
+        #registration_method.SetOptimizerAsLBFGS2(solutionAccuracy=1e-4, numberOfIterations=100, deltaConvergenceTolerance=0.01)
 
-        #registration_method.SetOptimizerScalesFromPhysicalShift()
-        
-        # Use multi-resolution approach with more aggressive smoothing
-        #registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
-        #registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
-        #registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+        registration_method.SetOptimizerAsLBFGSB(
+            gradientConvergenceTolerance=1e-5,
+            numberOfIterations=50,
+            maximumNumberOfCorrections=5,
+            maximumNumberOfFunctionEvaluations=1000,
+            costFunctionConvergenceFactor=1e+7
+        )
 
-        #registration_method.AddCommand(sitk.sitkIterationEvent, lambda: iteration_callback(registration_method))
-        
         # Execute registration
         bspline_transform = registration_method.Execute(fixed_image, moving_image)
-
-        #print("\nOptimizer's stopping condition, {0}".format(registration_method.GetOptimizerStopConditionDescription()))
         
         logging.info(f"B-spline Registration - Final metric value: {registration_method.GetMetricValue()}")
         
@@ -1315,9 +2424,9 @@ def bspline_inversion(bspline_transform, reference_image):
         # Invert the displacement field
         inverted_field = sitk.InvertDisplacementField(
             displacement_field,
-            maximumNumberOfIterations=100,  # Bachmann uses 25
-            meanErrorToleranceThreshold=0.0001,  # From Bachmann's paper
-            maxErrorToleranceThreshold=0.01,  # From Bachmann's paper
+            maximumNumberOfIterations=100,
+            meanErrorToleranceThreshold=0.0001,
+            maxErrorToleranceThreshold=0.01,
             enforceBoundaryCondition=True
         )
         
@@ -1423,11 +2532,12 @@ def compute_metrics(fixed_image, moving_image, scale_factor=5):
 def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_iterations=5, cp=[1,1,1], cores='detect'):
     """
     Perform Canonical Holistic Morphometric Analysis (cHMA) on trabecular bone images.
+    Modified to use ID.tiff naming convention.
     
     Parameters:
     input_dir (str): Directory containing filled and trabecular binary images
     output_dir (str): Directory to save output files
-    reference_name (str): Name of the reference condyle (default: "reference")
+    reference_name (str): Name of the reference bone (default: "reference")
     scale_factor (int): Factor by which to reduce image resolution for faster processing (default: 3)
     max_iterations (int): Maximum number of iterations for canonical bone creation (default: 5)
     cp (list): Control point grid spacing in mm for B-spline registration [x, y, z] (default: [1, 1, 1])
@@ -1471,18 +2581,19 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
         logging.info("=== Step A: Creating a canonical bone ===")
 
         # =====================================================================
-        # A1: Get a list of condyle names from filled images
+        # A1: Get a list of bone names from filled images
         # =====================================================================
         
         filled_dir = os.path.join(input_dir, "Filled")
         filled_files = [f for f in os.listdir(filled_dir) if f.endswith(".tiff") or f.endswith(".tif")]
-        condyle_names = [f.split("_filled_resampled")[0] for f in filled_files]
+        # Extract bone names (just the ID without extension)
+        bone_names = [os.path.splitext(f)[0] for f in filled_files]
         
-        logging.info(f"Found {len(condyle_names)} condyles: {', '.join(condyle_names)}")
+        logging.info(f"Found {len(bone_names)} Bones: {', '.join(bone_names)}")
         
-        # Ensure reference condyle is in the list
-        if f"{reference_name}_filled_resampled.tiff" not in filled_files:
-            logging.error(f"Reference condyle {reference_name} not found in input directory")
+        # Ensure reference bone is in the list
+        if f"{reference_name}.tiff" not in filled_files and f"{reference_name}.tif" not in filled_files:
+            logging.error(f"Reference bone {reference_name} not found in input directory")
             return False
 
         # =====================================================================
@@ -1492,7 +2603,9 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
         logging.info(f"A2. Performing initial similarity transformation using reference: {reference_name}")
         
         # Load reference image
-        reference_image_path = os.path.join(filled_dir, f"{reference_name}_filled_resampled.tiff")
+        reference_image_path = os.path.join(filled_dir, f"{reference_name}.tiff")
+        if not os.path.exists(reference_image_path):
+            reference_image_path = os.path.join(filled_dir, f"{reference_name}.tif")
         reference_image = load_image(reference_image_path)
         
         if reference_image is None:
@@ -1513,53 +2626,55 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
 
             similarity_transforms = {}
             
-            # Apply similarity transformation to each condyle
-            for condyle in condyle_names:
+            # Apply similarity transformation to each bone
+            for bone in bone_names:
                 try:
                     # Load original image
-                    moving_image_path = os.path.join(filled_dir, f"{condyle}_filled_resampled.tiff")
+                    moving_image_path = os.path.join(filled_dir, f"{bone}.tiff")
+                    if not os.path.exists(moving_image_path):
+                        moving_image_path = os.path.join(filled_dir, f"{bone}.tif")
                     moving_image = load_image(moving_image_path)
                     
                     if moving_image is None:
-                        logging.warning(f"Failed to load {condyle}. Skipping.")
+                        logging.warning(f"Failed to load {bone}. Skipping.")
                         continue
                     
                     # Resample moving image for registration
                     moving_image_rescaled = resample_image(moving_image, scale_factor)
                     if moving_image_rescaled is None:
-                        logging.warning(f"Failed to resample {condyle}. Skipping.")
+                        logging.warning(f"Failed to resample {bone}. Skipping.")
                         continue
     
-                    logging.info(f"Starting Similarity Registration for {condyle}.")
+                    logging.info(f"Starting Similarity Registration for {bone}.")
                     
                     # Register rescaled moving image to rescaled reference
                     transform = similarity_registration(reference_image_rescaled, moving_image_rescaled)
                     
                     if transform is None:
-                        logging.warning(f"Similarity registration failed for {condyle}. Skipping.")
+                        logging.warning(f"Similarity registration failed for {bone}. Skipping.")
                         continue
                     
                     # Save transform
-                    transform_path = os.path.join(output_dir, "Similarity_Transform", "Transforms", f"{condyle}.tfm")
+                    transform_path = os.path.join(output_dir, "Similarity_Transform", "Transforms", f"{bone}.tfm")
                     sitk.WriteTransform(transform, transform_path)
                     
                     # Apply transform to ORIGINAL (non-rescaled) image
                     transformed_image = apply_transform(moving_image, transform, reference_image)
                     
-                    transformed_image_path = os.path.join(output_dir, "Similarity_Transform", "Filled", f"{condyle}.tiff")
+                    transformed_image_path = os.path.join(output_dir, "Similarity_Transform", "Filled", f"{bone}.tiff")
                     sitk.WriteImage(transformed_image, transformed_image_path)
                     
                     # Store transform for averaging
-                    similarity_transforms[condyle] = transform
+                    similarity_transforms[bone] = transform
                     
-                    logging.info(f"Similarity registered {condyle} to reference")
+                    logging.info(f"Similarity registered {bone} to reference")
                     
                     # Clean up
                     del moving_image, moving_image_rescaled, transformed_image
                     gc.collect()
                     
                 except Exception as e:
-                    logging.error(f"Error processing {condyle} for similarity transform: {e}")
+                    logging.error(f"Error processing {bone} for similarity transform: {e}")
                     traceback.print_exc()
                     continue
             
@@ -1601,7 +2716,7 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
                 
                 # Apply inverse transform to ORIGINAL reference image
                 reference_avg = apply_transform(reference_image, inverse_avg_transform, interpolator=sitk.sitkNearestNeighbor)
-                reference_avg = prepare_condyle_image(reference_avg)
+                reference_avg = prepare_bone_image(reference_avg)
                 reference_avg = clean_intensity_image(reference_avg)
                 
                 if reference_avg is None:
@@ -1657,7 +2772,7 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
                 logging.error(f"Failed to resample canonical image in iteration {iteration}")
                 break
 
-            # Store condyle specific metrics
+            # Store bone specific metrics
             metrics = {
                 "dice": [],
                 "hd": [],
@@ -1669,22 +2784,22 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
             bspline_transforms = {}
             transformed_images = []
             
-            # Condyle Iteration
-            for condyle in condyle_names:
+            # bone Iteration
+            for bone in bone_names:
                 try:
                     # Load original filled image
-                    original_image_path = os.path.join(output_dir, "Similarity_Transform", "Filled", f"{condyle}.tiff")
+                    original_image_path = os.path.join(output_dir, "Similarity_Transform", "Filled", f"{bone}.tiff")
                     original_image = load_image(original_image_path)
                     
                     if original_image is None:
-                        logging.warning(f"Failed to load {condyle}. Skipping.")
+                        logging.warning(f"Failed to load {bone}. Skipping.")
                         continue
                     
                     # Resample for faster processing
                     original_image_rescaled = resample_image(original_image, scale_factor)
                     
                     if original_image_rescaled is None:
-                        logging.warning(f"Failed to resample {condyle}. Skipping.")
+                        logging.warning(f"Failed to resample {bone}. Skipping.")
                         continue
                     #======================================================
                     # Apply similarity transformation using RESCALED images
@@ -1694,13 +2809,13 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
                     )
                     
                     if similarity_transform is None:
-                        logging.warning(f"Similarity registration failed for {condyle} in iteration {iteration}. Skipping.")
+                        logging.warning(f"Similarity registration failed for {bone} in iteration {iteration}. Skipping.")
                         continue
 
                     #======================================================
                     # Save similarity transform
                     transform_path = os.path.join(
-                        output_dir, "Similarity_Transform", "Transforms2", f"{condyle}_iter{iteration}.tfm"
+                        output_dir, "Similarity_Transform", "Transforms2", f"{bone}_iter{iteration}.tfm"
                     )
                     sitk.WriteTransform(similarity_transform, transform_path)
                     
@@ -1714,7 +2829,7 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
                     similarity_image_rescaled = resample_image(similarity_image, scale_factor)
                     
                     if similarity_image_rescaled is None:
-                        logging.warning(f"Failed to apply similarity transform for {condyle} in iteration {iteration}. Skipping.")
+                        logging.warning(f"Failed to apply similarity transform for {bone} in iteration {iteration}. Skipping.")
                         continue
                         
                     #======================================================
@@ -1728,14 +2843,14 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
                     )
                     
                     if bspline_transform is None:
-                        logging.warning(f"B-spline registration failed for {condyle} in iteration {iteration}. Skipping.")
+                        logging.warning(f"B-spline registration failed for {bone} in iteration {iteration}. Skipping.")
                         continue
                         
                     #======================================================
                     # Save B-spline transform
                     
                     bspline_path = os.path.join(
-                        output_dir, "BSpline_Transform", "Transforms", f"{condyle}_iter{iteration}.tfm"
+                        output_dir, "BSpline_Transform", "Transforms", f"{bone}_iter{iteration}.tfm"
                     )
                     sitk.WriteTransform(bspline_transform, bspline_path)
                     
@@ -1749,30 +2864,30 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
                     )
                     
                     if bspline_full_res is None:
-                        logging.warning(f"Failed to apply B-spline transform to full-res image for {condyle}. Skipping.")
+                        logging.warning(f"Failed to apply B-spline transform to full-res image for {bone}. Skipping.")
                         continue
 
-                    logging.info(f"Successfully B-Spline Transformed, {condyle}, for iteration: {iteration}.")
+                    logging.info(f"Successfully B-Spline Transformed, {bone}, for iteration: {iteration}.")
                     
                     # Save transformed image
-                    transformed_path = os.path.join(output_dir, "BSpline_Transform", "Filled", f"{condyle}_iter{iteration}.tiff")
+                    transformed_path = os.path.join(output_dir, "BSpline_Transform", "Filled", f"{bone}_iter{iteration}.tiff")
                     sitk.WriteImage(bspline_full_res, transformed_path)
 
                     #========================================================
                     # Add to lists for averaging
-                    similarity_transforms2[condyle] = similarity_transform
-                    bspline_transforms[condyle] = bspline_transform
+                    similarity_transforms2[bone] = similarity_transform
+                    bspline_transforms[bone] = bspline_transform
 
                     #========================================================
                     # Compute metrics
                     dice, hd, msd = compute_metrics(canonical_image, bspline_full_res)
                     if dice is not None:
-                        logging.info(f"Metrics for {condyle}: Dice={dice:.4f}, HD={hd:.4f}, MSD={msd:.4f}")
+                        logging.info(f"Metrics for {bone}: Dice={dice:.4f}, HD={hd:.4f}, MSD={msd:.4f}")
                         metrics["dice"].append(dice)
                         metrics["hd"].append(hd)
                         metrics["msd"].append(msd)
                     
-                    logging.info(f"Successfully processed {condyle} in iteration {iteration}")
+                    logging.info(f"Successfully processed {bone} in iteration {iteration}")
                     
                     # Clean up
                     del original_image, original_image_rescaled, similarity_image_rescaled
@@ -1780,7 +2895,7 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
                     gc.collect()
                     
                 except Exception as e:
-                    logging.error(f"Error processing {condyle} in iteration {iteration}: {e}")
+                    logging.error(f"Error processing {bone} in iteration {iteration}: {e}")
                     traceback.print_exc()
                     continue
 
@@ -1794,31 +2909,6 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
             # Average BSpline transformed images
             gc.collect()
 
-           # try: 
-           #     for condyle in condyle_names:
-           #         transformed_path = os.path.join(output_dir, "BSpline_Transform", "Filled", f"{condyle}_iter{iteration}.tiff")
-           #         bspline_full_res = load_image(transformed_path)
-           #         transformed_images.append(bspline_full_res)
-           #         del bspline_full_res
-           # except Exception as e:
-           #         logging.error(f"Error retrieving transformed condyle images in iteration {iteration}: {e}")
-           #         traceback.print_exc()
-            
-            # Check if we have enough transformed images
-           # if len(transformed_images) < len(condyle_names) // 2:
-           #     logging.error(f"Too few successful transformations in iteration {iteration}. Stopping.")
-           #     break
-            
-           # gc.collect()
-           # averaged_image = average_images(transformed_images)
-            
-           # if averaged_image is None:
-           #     logging.error(f"Failed to average transformed images in iteration {iteration}")
-           #     break
-           # del transformed_images
-            
-           # logging.info(f"Successfully averaged transformed images for iteration {iteration}")
-
             #==================================================
             # Average BSpline Transforms through displacement field conversion
             gc.collect()
@@ -1827,7 +2917,7 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
             try:
                 # Make displacement fields from B-spline transforms
                 displacement_fields = []
-                for condyle, bspline_transform in bspline_transforms.items():
+                for bone, bspline_transform in bspline_transforms.items():
                     try:
                         displacement_field = sitk.TransformToDisplacementField(
                             bspline_transform,
@@ -1839,7 +2929,7 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
                         )
                         displacement_fields.append(displacement_field)
                     except Exception as e:
-                        logging.warning(f"Error converting B-spline to displacement field for {condyle}: {e}")
+                        logging.warning(f"Error converting B-spline to displacement field for {bone}: {e}")
                         continue
             
                 logging.info("Creating averaged inverted transform")
@@ -1856,7 +2946,6 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
                     #============================
                     # Apply transform with extra safeguards
                     logging.info("Creating canonical image")
-                    #inverted_image = apply_transform(averaged_image, inverted_transform, interpolator=sitk.sitkNearestNeighbor)
                     inverted_image = apply_transform(canonical_image, inverted_transform, interpolator=sitk.sitkNearestNeighbor)
                     #============================
                     # Verify inverted image has content
@@ -1968,34 +3057,38 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
 
         filled_dir = os.path.join(input_dir, "Filled")
         filled_files = [f for f in os.listdir(filled_dir) if f.endswith(".tiff") or f.endswith(".tif")]
-        condyle_names = [f.split("_filled_resampled")[0] for f in filled_files]
+        bone_names = [os.path.splitext(f)[0] for f in filled_files]
         
-        reference_image_path = os.path.join(filled_dir, f"{reference_name}_filled_resampled.tiff")
-        reference_image = chma.load_image(reference_image_path)
+        reference_image_path = os.path.join(filled_dir, f"{reference_name}.tiff")
+        if not os.path.exists(reference_image_path):
+            reference_image_path = os.path.join(filled_dir, f"{reference_name}.tif")
+        reference_image = load_image(reference_image_path)
                 
         trabecular_dir = os.path.join(input_dir, "Trabecular")
         transformed_trabecular_images = []
         
-        for condyle in condyle_names:
+        for bone in bone_names:
             # Load trabecular image
-            trabecular_path = os.path.join(trabecular_dir, f"{condyle}_trabecular_resampled.tiff")
-            trabecular_image = chma.load_image(trabecular_path)
+            trabecular_path = os.path.join(trabecular_dir, f"{bone}.tiff")
+            if not os.path.exists(trabecular_path):
+                trabecular_path = os.path.join(trabecular_dir, f"{bone}.tif")
+            trabecular_image = load_image(trabecular_path)
         
-            # Load initial similarity transform to align condyles
+            # Load initial similarity transform to align bones
             first_sim_path = os.path.join(
                 output_dir, "Similarity_Transform", "Transforms",
-                f"{condyle}.tfm"
+                f"{bone}.tfm"
             )
             
             # Load final transforms from last iteration
             last_iteration = 2
             similarity_path = os.path.join(
                 output_dir, "Similarity_Transform", "Transforms2", 
-                f"{condyle}_iter{last_iteration}.tfm"
+                f"{bone}_iter{last_iteration}.tfm"
             )
             bspline_path = os.path.join(
                 output_dir, "BSpline_Transform", "Transforms", 
-                f"{condyle}_iter{last_iteration}.tfm"
+                f"{bone}_iter{last_iteration}.tfm"
             )
         
             # Read transform paths
@@ -2007,19 +3100,19 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
             # Apply transforms
             
             # First similarity
-            trabecular_first = chma.apply_transform(trabecular_image, first_sim_transform, reference_image)
+            trabecular_first = apply_transform(trabecular_image, first_sim_transform, reference_image)
             
             # Second similarity
-            trabecular_similarity = chma.apply_transform(trabecular_first, similarity_transform, canonical_image)
+            trabecular_similarity = apply_transform(trabecular_first, similarity_transform, canonical_image)
         
-            tspath = os.path.join(output_dir, "Similarity_Transform", "Trabecular", f"{condyle}.tiff")
+            tspath = os.path.join(output_dir, "Similarity_Transform", "Trabecular", f"{bone}.tiff")
             sitk.WriteImage(trabecular_similarity, tspath)
             
             # Then B-spline
-            trabecular_bspline = chma.apply_transform(trabecular_similarity, bspline_transform, canonical_image)
+            trabecular_bspline = apply_transform(trabecular_similarity, bspline_transform, canonical_image)
         
             # Save transformed trabecular image
-            transformed_path = os.path.join(output_dir, "BSpline_Transform", "Trabecular", f"{condyle}.tiff")
+            transformed_path = os.path.join(output_dir, "BSpline_Transform", "Trabecular", f"{bone}.tiff")
             sitk.WriteImage(trabecular_bspline, transformed_path)
             
             # Add to list for averaging
@@ -2038,7 +3131,7 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
             
         # Use majority voting for binary images
         averaged_trabecular = None
-        averaged_trabecular = chma.average_images(transformed_trabecular_images) 
+        averaged_trabecular = average_images(transformed_trabecular_images)
         
         del transformed_trabecular_images
         
@@ -2049,6 +3142,9 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
         # Save canonical trabecular image
         trabecular_canonical_path = os.path.join(output_dir, "Canonical_Bone", "trabecular.tiff")
         sitk.WriteImage(averaged_trabecular, trabecular_canonical_path)
+
+        final_canonical_path = os.path.join(output_dir, "Canonical_Bone", "canonical.tiff")
+        averaged_trabecular = canonical_trabecular(final_canonical_path, trabecular_canonical_path, trabecular_canonical_path)
         
         # Calculate total runtime
         end_time = time.time()
@@ -2080,6 +3176,7 @@ The workflow consists of two main steps:
 3. Step C: Perform HMA analysis on the isotopological meshes
 """
 
+
 def create_directories1(output_dir):
     """Create the required directory structure for the cHMA workflow."""
     try:
@@ -2087,131 +3184,133 @@ def create_directories1(output_dir):
         os.makedirs(os.path.join(output_dir, "Trabecular"), exist_ok=True)
         os.makedirs(os.path.join(output_dir, "Isotopological_Meshes"), exist_ok=True)
         os.makedirs(os.path.join(output_dir, "HMA_Results"), exist_ok=True)
-        
+
         logging.info(f"Created directory structure in {output_dir}")
     except Exception as e:
         logging.error(f"Error creating directory structure: {e}")
         traceback.print_exc()
         raise
 
+
 def create_bone_presence_mask(trabecular_image, mesh):
     """Generate a mask showing where bone is present vs. absent"""
     try:
         logging.info("Creating bone presence mask...")
-        
+
         # Get image properties
         spacing = trabecular_image.GetSpacing()
         origin = trabecular_image.GetOrigin()
         size = trabecular_image.GetSize()
-        
+
         # Get binary image as numpy array (Z,Y,X order)
         array = sitk.GetArrayFromImage(trabecular_image)
-        
+
         # Create dilated version to include nearby regions
         from scipy import ndimage
         struct = ndimage.generate_binary_structure(3, 1)
         dilated = ndimage.binary_dilation(array, structure=struct, iterations=2)
-        
+
         # Create mask matching the mesh dimensions
         mask = np.zeros(len(mesh['vertices']), dtype=bool)
-        
+
         # Process in batches for efficiency
         batch_size = 10000
         total_batches = (len(mesh['vertices']) + batch_size - 1) // batch_size
-        
+
         for batch_idx in range(total_batches):
             start_idx = batch_idx * batch_size
             end_idx = min((batch_idx + 1) * batch_size, len(mesh['vertices']))
-            
+
             if batch_idx % 5 == 0:
-                logging.info(f"Processing mask batch {batch_idx+1}/{total_batches}")
-            
+                logging.info(f"Processing mask batch {batch_idx + 1}/{total_batches}")
+
             # For each vertex in batch
             for i in range(start_idx, end_idx):
                 vertex = mesh['vertices'][i]
-                
+
                 try:
                     # Convert physical coordinates to image indices
                     idx = trabecular_image.TransformPhysicalPointToIndex(vertex)
-                    
+
                     # Check if within image bounds
-                    if (0 <= idx[0] < size[0] and 
-                        0 <= idx[1] < size[1] and 
-                        0 <= idx[2] < size[2]):
-                        
+                    if (0 <= idx[0] < size[0] and
+                            0 <= idx[1] < size[1] and
+                            0 <= idx[2] < size[2]):
                         # Z,Y,X order in numpy array
                         mask[i] = dilated[idx[2], idx[1], idx[0]]
                 except Exception as e:
                     # Skip vertices that can't be mapped to image indices
                     continue
-        
+
         logging.info(f"Created bone presence mask with {np.sum(mask)} vertices in bone regions")
         return mask
-        
+
     except Exception as e:
         logging.error(f"Error creating bone presence mask: {e}")
         traceback.print_exc()
         # Return all True as fallback
         return np.ones(len(mesh['vertices']), dtype=bool)
 
+
 def calculate_confidence_scores(mesh, trabecular_image, grid_points, grid_values):
     """Calculate confidence scores for each vertex based on distance to valid samples"""
     try:
         logging.info("Calculating confidence scores for mesh vertices...")
         confidence = np.zeros(len(mesh['vertices']))
-        
+
         # Create KD-tree for grid points
         from scipy.spatial import cKDTree
         tree = cKDTree(grid_points)
-        
+
         # Process in batches
         batch_size = 10000
         total_batches = (len(mesh['vertices']) + batch_size - 1) // batch_size
-        
+
         for batch_idx in range(total_batches):
             start_idx = batch_idx * batch_size
             end_idx = min((batch_idx + 1) * batch_size, len(mesh['vertices']))
-            
+
             if batch_idx % 5 == 0:
-                logging.info(f"Processing confidence batch {batch_idx+1}/{total_batches}")
-            
+                logging.info(f"Processing confidence batch {batch_idx + 1}/{total_batches}")
+
             # Get vertices in this batch
             batch_vertices = mesh['vertices'][start_idx:end_idx]
-            
+
             # Find nearest grid points
             k = 8  # Number of nearest neighbors to consider
             distances, indices = tree.query(batch_vertices, k=k)
-            
+
             # For each vertex
             for i in range(end_idx - start_idx):
                 # Check BV/TV values at nearest grid points
                 nearby_bvtv = grid_values['bv_tv'][indices[i]]
-                
+
                 # Calculate distance-weighted average of BV/TV
                 weights = 1.0 / (distances[i] + 1e-10)
                 weights = weights / np.sum(weights)
-                
+
                 # Count valid sampling points (those with meaningful BV/TV)
                 valid_points = np.sum(nearby_bvtv > 0.01)
-                
+
                 # Calculate confidence based on:
                 # 1. Number of valid sampling points
                 # 2. Inverse distance to those points
                 # 3. Mean BV/TV value (higher BV/TV = more confidence)
                 if valid_points > 0:
                     mean_bvtv = np.sum(weights * nearby_bvtv)
-                    confidence[start_idx + i] = (valid_points / k) * (1.0 - np.mean(distances[i]) / 10.0) * min(1.0, mean_bvtv * 5)
+                    confidence[start_idx + i] = (valid_points / k) * (1.0 - np.mean(distances[i]) / 10.0) * min(1.0,
+                                                                                                                mean_bvtv * 5)
                 else:
                     confidence[start_idx + i] = 0.0
-        
+
         # Normalize confidence to [0, 1]
         max_conf = np.max(confidence)
         if max_conf > 0:
             confidence = confidence / max_conf
-        
+
         logging.info(f"Calculated confidence scores: mean = {np.mean(confidence):.4f}")
         return confidence
-        
+
     except Exception as e:
         logging.error(f"Error calculating confidence scores: {e}")
         traceback.print_exc()
@@ -2232,7 +3331,7 @@ def apply_transform(image, transform, reference_image=None, interpolator=sitk.si
         if stats.GetSum() < 1:
             logging.warning("Cannot transform empty image")
             return image
-        
+
         # Apply transform
         if reference_image is None:
             transformed = sitk.Resample(
@@ -2253,41 +3352,42 @@ def apply_transform(image, transform, reference_image=None, interpolator=sitk.si
                 image.GetPixelID()
             )
         transformed = cleanup(transformed)
-        
+
         return transformed
-        
+
     except Exception as e:
         logging.error(f"Error applying transform: {e}")
         traceback.print_exc()
         return image
 
-def find_transforms_for_condyle(input_dir, condyle_name, iteration):
+
+def find_transforms_for_bone(input_dir, bone_name, iteration):
     """
-    Find transform files for a given condyle with flexible naming pattern matching.
-    
+    Find transform files for a given bone with flexible naming pattern matching.
+
     Parameters:
     -----------
     output_dir : str
         Base output directory
-    condyle_name : str
-        Name of the condyle to find transforms for
+    bone_name : str
+        Name of the bone to find transforms for
     iteration : int
         Number of the last iteration
-        
+
     Returns:
     --------
     tuple or None
         (similarity_transform, bspline_transform) or None if not found
     """
     try:
-        # Possible name patterns for the condyle in transform files
+        # Possible name patterns for the bone in transform files
         possible_patterns = [
-            f"{condyle_name}",                    # Basic pattern
-            f"{condyle_name.split('_')[0]}",      # First part before underscore
-            f"{condyle_name.replace('.tiff', '')}", # Remove .tiff
-            f"{condyle_name.replace('_trabecular_resampled', '')}" # Remove _trabecular_resampled
+            f"{bone_name}",  # Basic pattern
+            f"{bone_name.split('_')[0]}",  # First part before underscore
+            f"{bone_name.replace('.tiff', '')}",  # Remove .tiff
+            f"{bone_name.replace('_trabecular_resampled', '')}"  # Remove _trabecular_resampled
         ]
-        
+
         similarity_transform = None
         bspline_transform = None
 
@@ -2301,7 +3401,7 @@ def find_transforms_for_condyle(input_dir, condyle_name, iteration):
                     break
             if sim_tfm:
                 break
-        
+
         # Try to find the iterated similarity
         sim_dir_iter = os.path.join(input_dir, "Similarity_Transform", "Transforms2")
         for pattern in possible_patterns:
@@ -2312,9 +3412,9 @@ def find_transforms_for_condyle(input_dir, condyle_name, iteration):
                     break
             if similarity_transform:
                 break
-                
+
         # Try to find B-spline transform
-        bspline_dir = os.path.join(input_dir, "BSpline_Transform", "Transforms2")
+        bspline_dir = os.path.join(input_dir, "BSpline_Transform", "Transforms")
         for pattern in possible_patterns:
             for suffix in ["", ".tfm", f"_iter{iteration}", f"_iter{iteration}.tfm"]:
                 transform_path = os.path.join(bspline_dir, f"{pattern}{suffix}")
@@ -2331,21 +3431,22 @@ def find_transforms_for_condyle(input_dir, condyle_name, iteration):
         return bspline_tfm
 
     except Exception as e:
-        logging.error(f"Error finding transforms for {condyle_name}: {e}")
+        logging.error(f"Error finding transforms for {bone_name}: {e}")
         traceback.print_exc()
         return None
+
 
 def load_tetgen(node_path, ele_path):
     """
     Load a tetrahedral mesh directly from TetGen .node and .ele files.
-    
+
     Parameters:
     -----------
     node_path : str
         Path to the .node file containing vertex coordinates
     ele_path : str
         Path to the .ele file containing tetrahedral elements
-        
+
     Returns:
     --------
     dict or None
@@ -2353,40 +3454,40 @@ def load_tetgen(node_path, ele_path):
     """
     try:
         logging.info(f"Loading TetGen mesh from {node_path} and {ele_path}")
-        
+
         # Check if files exist
         if not os.path.exists(node_path) or not os.path.exists(ele_path):
             logging.error("Node or element file not found")
             return None
-            
+
         # Read vertices from .node file
         with open(node_path, 'r') as f:
             lines = f.readlines()
-            
+
         # Parse header
         header = lines[0].strip().split()
         num_points = int(header[0])
         dimension = int(header[1])
         num_attributes = int(header[2])
         has_boundary = int(header[3])
-        
+
         # Read vertices
         vertices = []
         for i in range(1, num_points + 1):
             line = lines[i].strip().split()
             # Format: index x y z [attributes] [boundary marker]
             vertices.append([float(line[1]), float(line[2]), float(line[3])])
-            
+
         # Read elements from .ele file
         with open(ele_path, 'r') as f:
             lines = f.readlines()
-            
+
         # Parse header
         header = lines[0].strip().split()
         num_tets = int(header[0])
         nodes_per_tet = int(header[1])
         has_region = int(header[2]) if len(header) > 2 else 0
-        
+
         # Read tetrahedra
         tetrahedra = []
         for i in range(1, num_tets + 1):
@@ -2394,37 +3495,38 @@ def load_tetgen(node_path, ele_path):
             # Format: index n1 n2 n3 n4 [region]
             # Note: TetGen is 1-indexed, need to convert to 0-indexed
             tetrahedra.append([
-                int(line[1]) - 1, 
-                int(line[2]) - 1, 
-                int(line[3]) - 1, 
+                int(line[1]) - 1,
+                int(line[2]) - 1,
+                int(line[3]) - 1,
                 int(line[4]) - 1
             ])
-            
+
         logging.info(f"Loaded TetGen mesh with {len(vertices)} vertices and {len(tetrahedra)} tetrahedra")
-        
+
         # Create mesh dictionary
         mesh_dict = {
             "vertices": np.array(vertices),
             "tetrahedra": np.array(tetrahedra),
             "surface_triangles": np.array([])  # Surface triangles would require reading .face file
         }
-        
+
         return mesh_dict
-        
+
     except Exception as e:
         logging.error(f"Error loading TetGen mesh: {e}")
         traceback.print_exc()
         return None
 
+
 def load_netgen(filepath):
     """
     Load a tetrahedral mesh from a Netgen .vol file with format-specific parsing.
-    
+
     Parameters:
     -----------
     filepath : str
         Path to the .vol file
-        
+
     Returns:
     --------
     dict or None
@@ -2432,24 +3534,24 @@ def load_netgen(filepath):
     """
     try:
         logging.info(f"Loading Netgen .vol mesh from {filepath}")
-        
+
         # Check if file exists
         if not os.path.exists(filepath):
             logging.error(f"File {filepath} not found")
             return None
-            
+
         # Parse the VOL file
         vertices = []
         tetrahedra = []
-        
+
         with open(filepath, 'r') as f:
             lines = f.readlines()
-        
+
         # Process the file line by line
         i = 0
         while i < len(lines):
             line = lines[i].strip()
-            
+
             # Look for the points section
             if line == "points":
                 i += 1  # Move to the next line (number of points)
@@ -2458,25 +3560,25 @@ def load_netgen(filepath):
                         num_points = int(lines[i].strip())
                         logging.info(f"Found points section with {num_points} vertices")
                         i += 1  # Move to the first point
-                        
+
                         # Read all points
                         for j in range(num_points):
-                            if i+j < len(lines):
+                            if i + j < len(lines):
                                 try:
                                     # Strip out any text and get the coordinates
-                                    coords_line = lines[i+j].strip()
+                                    coords_line = lines[i + j].strip()
                                     # Split by whitespace and convert to float
                                     parts = [float(x) for x in coords_line.split()]
                                     if len(parts) >= 3:
                                         vertices.append(parts[:3])
                                 except Exception as e:
-                                    logging.warning(f"Error parsing vertex at line {i+j}: {e}")
-                        
+                                    logging.warning(f"Error parsing vertex at line {i + j}: {e}")
+
                         i += num_points  # Skip past all the vertices
                         continue
                     except ValueError:
                         logging.warning(f"Could not parse number of points: {lines[i].strip()}")
-            
+
             # Look for the volumeelements section
             elif line == "volumeelements":
                 i += 1  # Move to the next line (number of elements)
@@ -2485,14 +3587,14 @@ def load_netgen(filepath):
                         num_elements = int(lines[i].strip())
                         logging.info(f"Found volumeelements section with {num_elements} elements")
                         i += 1  # Move to the first volume element
-                        
+
                         # Read all volume elements
                         for j in range(num_elements):
-                            if i+j < len(lines):
+                            if i + j < len(lines):
                                 try:
                                     # Parse the element line
-                                    parts = [int(x) for x in lines[i+j].strip().split()]
-                                    
+                                    parts = [int(x) for x in lines[i + j].strip().split()]
+
                                     # Netgen volumeelements format is usually:
                                     # element_type material domain [vertices]
                                     # element_type 1 is typically a tetrahedron with 4 vertices
@@ -2500,50 +3602,51 @@ def load_netgen(filepath):
                                         # Get the last 4 elements as vertex indices (1-indexed)
                                         tet_indices = parts[-4:]
                                         # Convert to 0-indexed for our mesh format
-                                        tetrahedra.append([idx-1 for idx in tet_indices])
+                                        tetrahedra.append([idx - 1 for idx in tet_indices])
                                 except Exception as e:
-                                    logging.warning(f"Error parsing tetrahedron at line {i+j}: {e}")
-                        
+                                    logging.warning(f"Error parsing tetrahedron at line {i + j}: {e}")
+
                         i += num_elements  # Skip past all the elements
                         continue
                     except ValueError:
                         logging.warning(f"Could not parse number of volume elements: {lines[i].strip()}")
-            
+
             i += 1  # Move to the next line
-        
+
         # Verify we have data
         if not vertices:
             logging.error("No vertices found in the file")
             return None
-            
+
         if not tetrahedra:
             logging.error("No tetrahedra found in the file")
             return None
-        
+
         logging.info(f"Successfully loaded Netgen mesh with {len(vertices)} vertices and {len(tetrahedra)} tetrahedra")
-        
+
         mesh_dict = {
             "vertices": np.array(vertices),
             "tetrahedra": np.array(tetrahedra),
             "surface_triangles": np.array([])  # Surface triangles could be extracted later if needed
         }
-        
+
         return mesh_dict
-        
+
     except Exception as e:
         logging.error(f"Error loading Netgen .vol mesh: {e}")
         traceback.print_exc()
         return None
 
+
 def load_gmsh(filepath):
     """
     Load a tetrahedral mesh from a Gmsh .msh file.
-    
+
     Parameters:
     -----------
     filepath : str
         Path to the .msh file
-        
+
     Returns:
     --------
     dict or None
@@ -2551,86 +3654,87 @@ def load_gmsh(filepath):
     """
     try:
         logging.info(f"Loading Gmsh .msh mesh from {filepath}")
-        
+
         # Check if file exists
         if not os.path.exists(filepath):
             logging.error(f"File {filepath} not found")
             return None
-            
+
         # Parse the MSH file
         vertices = []
         tetrahedra = []
-        
+
         with open(filepath, 'r') as f:
             lines = f.readlines()
-            
+
         i = 0
         while i < len(lines):
             line = lines[i].strip()
-            
+
             # Read nodes
             if line == "$Nodes":
                 i += 1
                 num_vertices = int(lines[i].strip())
                 i += 1
-                
+
                 for j in range(num_vertices):
-                    if i+j < len(lines):
-                        parts = lines[i+j].strip().split()
+                    if i + j < len(lines):
+                        parts = lines[i + j].strip().split()
                         if len(parts) >= 4:
                             # Format: node_idx x y z
                             vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
-                
+
                 i += num_vertices
-                
+
             # Read elements
             elif line == "$Elements":
                 i += 1
                 num_elements = int(lines[i].strip())
                 i += 1
-                
+
                 for j in range(num_elements):
-                    if i+j < len(lines):
-                        parts = lines[i+j].strip().split()
+                    if i + j < len(lines):
+                        parts = lines[i + j].strip().split()
                         if len(parts) > 4:
                             element_type = int(parts[1])
                             # Element type 4 is a tetrahedron
                             if element_type == 4:
                                 # Convert 1-indexed to 0-indexed
                                 # Format varies based on MSH version, but last 4 values are always vertices
-                                tet_indices = [int(parts[-4])-1, int(parts[-3])-1, 
-                                              int(parts[-2])-1, int(parts[-1])-1]
+                                tet_indices = [int(parts[-4]) - 1, int(parts[-3]) - 1,
+                                               int(parts[-2]) - 1, int(parts[-1]) - 1]
                                 tetrahedra.append(tet_indices)
-                
+
                 i += num_elements
-                
+
             else:
                 i += 1
-                
+
         logging.info(f"Loaded Gmsh .msh mesh with {len(vertices)} vertices and {len(tetrahedra)} tetrahedra")
-        
+
         mesh_dict = {
             "vertices": np.array(vertices),
             "tetrahedra": np.array(tetrahedra),
             "surface_triangles": np.array([])  # Surface triangles would need to be extracted
         }
-        
+
         return mesh_dict
-        
+
     except Exception as e:
         logging.error(f"Error loading Gmsh .msh mesh: {e}")
         traceback.print_exc()
         return None
 
+
 def load_vtk(filepath):
     """
     Load an existing VTK mesh file with better handling for quadratic tetrahedra.
-    
+
     Parameters:
     -----------
     filepath : str
         Path to the VTK file
-        
+
     Returns:
     --------
     dict or None
@@ -2638,26 +3742,26 @@ def load_vtk(filepath):
     """
     try:
         logging.info(f"Attempting to load existing mesh from {filepath}")
-        
+
         # Check if file exists
         if not os.path.exists(filepath):
             logging.info(f"No existing mesh found at {filepath}")
             return None
-        
+
         # Try with generic VTK file reader first
         reader = vtk.vtkGenericDataObjectReader()
         reader.SetFileName(filepath)
         reader.Update()
-        
+
         # Check if reader was successful
         if not reader.IsFileValid(filepath):
             logging.warning(f"File {filepath} is not a valid VTK file")
             return None
-            
+
         # Determine what type of data we have
         data = reader.GetOutput()
         data_type = data.GetDataObjectType()
-        
+
         # Use appropriate reader based on data type
         if data_type == vtk.VTK_POLY_DATA:
             logging.info(f"Detected PolyData in {filepath}")
@@ -2668,11 +3772,11 @@ def load_vtk(filepath):
         else:
             logging.warning(f"Unsupported VTK data type: {data_type}")
             return None
-            
+
         reader.SetFileName(filepath)
         reader.Update()
         mesh = reader.GetOutput()
-        
+
         # Log cell information
         cell_types = {}
         for i in range(mesh.GetNumberOfCells()):
@@ -2681,24 +3785,24 @@ def load_vtk(filepath):
                 cell_types[cell_type] += 1
             else:
                 cell_types[cell_type] = 1
-                
+
         logging.info(f"Cell types found: {cell_types}")
-        
+
         # Extract points
         points = []
         for i in range(mesh.GetNumberOfPoints()):
             points.append(list(mesh.GetPoint(i)))
         points = np.array(points)
-        
+
         # Extract tetrahedra
         tetrahedra = []
         triangles = []
-        
+
         # Handle different cell types
         for i in range(mesh.GetNumberOfCells()):
             cell = mesh.GetCell(i)
             cell_type = cell.GetCellType()
-            
+
             if cell_type == vtk.VTK_TETRA:
                 # Linear tetrahedron
                 tetrahedra.append([cell.GetPointId(j) for j in range(4)])
@@ -2707,25 +3811,25 @@ def load_vtk(filepath):
                 tetrahedra.append([cell.GetPointId(j) for j in range(4)])
             elif cell_type == vtk.VTK_TRIANGLE:
                 triangles.append([cell.GetPointId(j) for j in range(3)])
-                
+
         # Log what we found
         logging.info(f"Found {len(points)} vertices, {len(tetrahedra)} tetrahedra, {len(triangles)} triangles")
-        
+
         # Check if we have tetrahedra
         if len(tetrahedra) == 0:
             logging.warning("No tetrahedra found. This mesh may not be suitable for analysis.")
-            
+
             # Try to convert from surface if we have triangles
             if len(triangles) > 0:
                 logging.info("Attempting to generate tetrahedra from surface triangles...")
-                
+
                 # Create a clean polydata surface
                 surface = vtk.vtkPolyData()
                 vtkPoints = vtk.vtkPoints()
                 for point in points:
                     vtkPoints.InsertNextPoint(point)
                 surface.SetPoints(vtkPoints)
-                
+
                 # Add triangles
                 vtkCells = vtk.vtkCellArray()
                 for tri in triangles:
@@ -2734,14 +3838,14 @@ def load_vtk(filepath):
                         vtkTriangle.GetPointIds().SetId(j, tri[j])
                     vtkCells.InsertNextCell(vtkTriangle)
                 surface.SetPolys(vtkCells)
-                
+
                 # Generate tetrahedral mesh using Delaunay3D
                 delaunay = vtk.vtkDelaunay3D()
                 delaunay.SetInputData(surface)
                 delaunay.SetTolerance(0.001)
                 delaunay.SetOffset(5.0)  # Larger offset for better results
                 delaunay.Update()
-                
+
                 # Extract tetrahedra
                 tetMesh = delaunay.GetOutput()
                 tetrahedra = []
@@ -2749,16 +3853,16 @@ def load_vtk(filepath):
                     cell = tetMesh.GetCell(i)
                     if cell.GetCellType() == vtk.VTK_TETRA:
                         tetrahedra.append([cell.GetPointId(j) for j in range(4)])
-                
+
                 logging.info(f"Generated {len(tetrahedra)} tetrahedra from surface")
-        
+
         # Create the mesh dictionary
         mesh_dict = {
             "vertices": points,
             "tetrahedra": np.array(tetrahedra),
             "surface_triangles": np.array(triangles)
         }
-        
+
         # Verify mesh quality
         if len(tetrahedra) > 0:
             from collections import Counter
@@ -2767,7 +3871,7 @@ def load_vtk(filepath):
             duplicates = [item for item, count in tet_counter.items() if count > 1]
             if duplicates:
                 logging.warning(f"Found {len(duplicates)} duplicate tetrahedra")
-            
+
             # Check for inverted elements
             negative_volume = 0
             for tet in tetrahedra:
@@ -2775,41 +3879,41 @@ def load_vtk(filepath):
                 v1 = points[tet[1]]
                 v2 = points[tet[2]]
                 v3 = points[tet[3]]
-                
+
                 e1 = np.array(v1) - np.array(v0)
                 e2 = np.array(v2) - np.array(v0)
                 e3 = np.array(v3) - np.array(v0)
-                
+
                 volume = np.dot(np.cross(e1, e2), e3) / 6.0
                 if volume <= 0:
                     negative_volume += 1
-            
+
             if negative_volume > 0:
                 logging.warning(f"Found {negative_volume} tetrahedra with negative or zero volume")
-            
+
             logging.info(f"Loaded mesh with {len(points)} vertices and {len(tetrahedra)} tetrahedra")
-        
+
         return mesh_dict
-        
+
     except Exception as e:
         logging.error(f"Error loading VTK mesh: {e}")
         traceback.print_exc()
         return None
 
-def create_solid_tetrahedral_mesh2(image, method="tetgen",edge_length=1.0,output_dir=None):
 
+def create_solid_tetrahedral_mesh2(image, method="tetgen", edge_length=1.0, output_dir=None):
     import pymesh
-    
+
     spacing = np.array(image.GetSpacing())
     origin = np.array(image.GetOrigin())
     size = np.array(image.GetSize())
 
     image_array = sitk.GetArrayFromImage(image)
-    
+
     # Generate mesh with TetGen or another tool
     # Example using pymesh
     mesh = pymesh.generate_tet_mesh(image_array)
-    
+
     # Mesh vertices and tetrahedra
     vertices = mesh.vertices
     tetrahedra = mesh.elements
@@ -2817,15 +3921,15 @@ def create_solid_tetrahedral_mesh2(image, method="tetgen",edge_length=1.0,output
     vertices = vertices * spacing + origin
 
     return {
-    "vertices": vertices,
-    "tetrahedra": tetrahedra
+        "vertices": vertices,
+        "tetrahedra": tetrahedra
     }
 
 
 def create_solid_tetrahedral_mesh(image, method="tetgen", edge_length=1.0, output_dir=None):
     """
     Create a solid tetrahedral mesh from a binary trabecular mask using various meshing methods.
-    
+
     Parameters:
     -----------
     image : sitk.Image
@@ -2836,169 +3940,168 @@ def create_solid_tetrahedral_mesh(image, method="tetgen", edge_length=1.0, outpu
         Target edge length for mesh in mm (smaller = finer mesh)
     output_dir : str
         Directory to save intermediate results
-        
+
     Returns:
     --------
     dict or None
         Dictionary containing mesh data or None if meshing fails
     """
     try:
-            
+
         # Get image properties
         spacing = image.GetSpacing()
         origin = image.GetOrigin()
-        
+
         # Convert to numpy array for processing
         np_array = sitk.GetArrayFromImage(image)
-        
+
         np_array = ndimage.binary_fill_holes(np_array)
-        
-        #smoothed = ndimage.gaussian_filter(filled_array.astype(float), sigma=0.5)
+
+        # smoothed = ndimage.gaussian_filter(filled_array.astype(float), sigma=0.5)
 
         np_array = np.transpose(np_array, (2, 1, 0))  # Fix axis orientation
-        
+
         # Extract isosurface using marching cubes
         from skimage import measure
         verts, faces, normals, _ = measure.marching_cubes(
-            volume=np_array, 
+            volume=np_array,
             level=0.5,
             spacing=spacing,
             allow_degenerate=False
         )
-        
+
         # Adjust vertices for origin offset
         verts = verts + np.array(origin)
 
-        
         logging.info(f"Surface mesh created with {len(verts)} vertices and {len(faces)} triangles")
-        
+
         # Create tetrahedral mesh using selected method
         if method == "tetgen":
             import tetgen
-            
+
             # Create TetGen object
             tgen = tetgen.TetGen(verts, faces)
-            
+
             # Parameters for solid mesh based on Bachmann et al. (2022)
             nodes, elements = tgen.tetrahedralize(
                 quality=True,
-                plc=True,                  # Preserve input geometry
-                minratio=1.0,              # Quality constraint
-                mindihedral=30.0,          # Minimum angle
-                maxvolume=edge_length**3,  # Control element size
-                steinerleft=100000,        # Allow sufficient refinement points
-                nobisect=False             # Allow boundary refinement
+                plc=True,  # Preserve input geometry
+                minratio=1.0,  # Quality constraint
+                mindihedral=30.0,  # Minimum angle
+                maxvolume=edge_length ** 3,  # Control element size
+                steinerleft=100000,  # Allow sufficient refinement points
+                nobisect=False  # Allow boundary refinement
             )
-            
+
             mesh_dict = {
                 "vertices": nodes,
                 "tetrahedra": elements,
                 "surface_triangles": faces
             }
-            
+
         elif method == "netgen":
             # Try to use NGLib if available
             try:
                 import nglib
-                
+
                 # Initialize NGLib
                 nglib.Init()
-                
+
                 # Create a temporary STL file for NetGen
                 import tempfile
                 import stl
                 from stl import mesh as stl_mesh
-                
+
                 with tempfile.NamedTemporaryFile(suffix='.stl', delete=False) as tmp:
                     stl_file = tmp.name
-                
+
                 # Save surface as STL
                 surface = stl_mesh.Mesh(np.zeros(faces.shape[0], dtype=stl_mesh.Mesh.dtype))
                 for i, f in enumerate(faces):
                     for j in range(3):
-                        surface.vectors[i][j] = verts[f[j],:]
+                        surface.vectors[i][j] = verts[f[j], :]
                 surface.save(stl_file)
-                
+
                 # Initialize NetGen mesh
                 mesh = nglib.Mesh()
-                
+
                 # Load STL file
                 mesh.Import(stl_file)
-                
+
                 # Set meshing parameters for solid volume
                 mp = nglib.MeshingParameters()
-                mp.maxh = edge_length      # Max element size
+                mp.maxh = edge_length  # Max element size
                 mp.minh = edge_length / 5  # Min element size
-                mp.fineness = 0.5          # Medium mesh refinement
-                mp.secondorder = 0         # Linear elements
-                
+                mp.fineness = 0.5  # Medium mesh refinement
+                mp.secondorder = 0  # Linear elements
+
                 # Generate volume mesh
                 mesh.GenerateVolumeMesh(mp)
-                
+
                 # Extract mesh data
                 vertices = []
                 tetrahedra = []
-                
+
                 # Extract vertices
                 for i in range(1, mesh.GetNP() + 1):
                     p = mesh.GetPoint(i)
                     vertices.append([p.p[0], p.p[1], p.p[2]])
-                
+
                 # Extract tetrahedra
                 for i in range(1, mesh.GetNE() + 1):
                     el = mesh.GetElement(i)
                     if el.GetType() == 1:  # Tetrahedral elements
-                        tetrahedra.append([el.GetVertex(j)-1 for j in range(4)])  # 0-indexed
-                
+                        tetrahedra.append([el.GetVertex(j) - 1 for j in range(4)])  # 0-indexed
+
                 mesh_dict = {
                     "vertices": np.array(vertices),
                     "tetrahedra": np.array(tetrahedra),
                     "surface_triangles": faces
                 }
-                
+
                 # Clean up temporary file
                 os.unlink(stl_file)
-                
+
             except ImportError:
                 logging.warning("NGLib not available. Falling back to TetGen.")
-                
+
                 # Fall back to TetGen
                 import tetgen
                 tgen = tetgen.TetGen(verts, faces)
                 nodes, elements = tgen.tetrahedralize(quality=True, minratio=2.0, mindihedral=10.0)
-                
+
                 mesh_dict = {
                     "vertices": nodes,
                     "tetrahedra": elements,
                     "surface_triangles": faces
                 }
-                
+
         elif method == "gmsh":
             try:
                 import gmsh
-                
+
                 # Initialize GMsh
                 gmsh.initialize()
                 gmsh.model.add("solid_mesh")
-                
+
                 # Create temporary STL file
                 import tempfile
                 import stl
                 from stl import mesh as stl_mesh
-                
+
                 with tempfile.NamedTemporaryFile(suffix='.stl', delete=False) as tmp:
                     stl_file = tmp.name
-                
+
                 # Save surface as STL
                 surface = stl_mesh.Mesh(np.zeros(faces.shape[0], dtype=stl_mesh.Mesh.dtype))
                 for i, f in enumerate(faces):
                     for j in range(3):
-                        surface.vectors[i][j] = verts[f[j],:]
+                        surface.vectors[i][j] = verts[f[j], :]
                 surface.save(stl_file)
-                
+
                 # Load STL file into GMsh
                 gmsh.merge(stl_file)
-                
+
                 # Create volume from surface
                 surface_loop_tags = gmsh.model.getEntities(2)  # Get all surfaces
                 if surface_loop_tags:
@@ -3006,27 +4109,27 @@ def create_solid_tetrahedral_mesh(image, method="tetgen", edge_length=1.0, outpu
                     loop_tag = gmsh.model.geo.addSurfaceLoop([tag[1] for tag in surface_loop_tags])
                     volume_tag = gmsh.model.geo.addVolume([loop_tag])
                     gmsh.model.geo.synchronize()
-                    
+
                     # Set meshing parameters
                     gmsh.option.setNumber("Mesh.CharacteristicLengthMax", edge_length)
                     gmsh.option.setNumber("Mesh.CharacteristicLengthMin", edge_length / 5)
                     gmsh.option.setNumber("Mesh.Algorithm3D", 1)  # Delaunay algorithm
-                    
+
                     # Generate 3D mesh
                     gmsh.model.mesh.generate(3)
-                    
+
                     # Get nodes
                     nodeTags, nodeCoords, _ = gmsh.model.mesh.getNodes()
                     vertices = np.array(nodeCoords).reshape(-1, 3)
-                    
+
                     # Get tetrahedra (element type 4)
                     elementTypes, elementTags, elementNodeTags = gmsh.model.mesh.getElements(3)  # 3D elements
-                    
+
                     if 4 in elementTypes:  # Check if tetrahedra exist
                         tet_idx = elementTypes.index(4)
                         tet_tags = elementNodeTags[tet_idx]
                         tetrahedra = np.array(tet_tags).reshape(-1, 4) - 1  # Convert to 0-indexed
-                        
+
                         mesh_dict = {
                             "vertices": vertices,
                             "tetrahedra": tetrahedra,
@@ -3036,37 +4139,37 @@ def create_solid_tetrahedral_mesh(image, method="tetgen", edge_length=1.0, outpu
                         raise ValueError("No tetrahedral elements created by GMsh")
                 else:
                     raise ValueError("No surfaces found in STL file")
-                
+
                 # Clean up
                 gmsh.finalize()
                 os.unlink(stl_file)
-                
+
             except (ImportError, ValueError) as e:
                 logging.warning(f"GMsh failed: {e}. Falling back to TetGen.")
-                
+
                 # Fall back to TetGen
                 import tetgen
                 tgen = tetgen.TetGen(verts, faces)
                 nodes, elements = tgen.tetrahedralize(quality=True, minratio=2.0, mindihedral=10.0)
-                
+
                 mesh_dict = {
                     "vertices": nodes,
                     "tetrahedra": elements,
                     "surface_triangles": faces
                 }
-        
+
         else:
             raise ValueError(f"Unknown meshing method: {method}")
-        
+
         # Save mesh if output directory provided
         if output_dir:
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
-            
+
             # Save as VTK
             vtk_path = os.path.join(output_dir, "trabecular_solid_mesh.vtk")
             save_mesh_as_vtk(mesh_dict, vtk_path)
-            
+
             # Also save in native format of chosen method
             if method == "tetgen":
                 # Save TetGen files (.node, .ele)
@@ -3080,17 +4183,18 @@ def create_solid_tetrahedral_mesh(image, method="tetgen", edge_length=1.0, outpu
                 # Save GMsh .msh file
                 msh_path = os.path.join(output_dir, "trabecular.msh")
                 save_gmsh_msh(mesh_dict, msh_path)
-        
+
         # Evaluate mesh quality
         tet_collapse, volume_skew = evaluate_mesh_quality(mesh_dict)
         logging.info(f"Mesh quality - Tet collapse: {tet_collapse:.4f}, Volume skew: {volume_skew:.4f}")
-        
+
         return mesh_dict
-        
+
     except Exception as e:
         logging.error(f"Error creating solid tetrahedral mesh: {e}")
         traceback.print_exc()
         return None
+
 
 def save_tetgen_files(mesh, base_path):
     """Save mesh in TetGen format (.node and .ele files)"""
@@ -3101,8 +4205,8 @@ def save_tetgen_files(mesh, base_path):
             f.write(f"{len(mesh['vertices'])} 3 0 0\n")
             # Write vertices: index x y z
             for i, v in enumerate(mesh['vertices']):
-                f.write(f"{i+1} {v[0]} {v[1]} {v[2]}\n")
-                
+                f.write(f"{i + 1} {v[0]} {v[1]} {v[2]}\n")
+
         # Save .ele file (tetrahedra)
         with open(f"{base_path}.ele", 'w') as f:
             # Header: num_tets nodes_per_tet attribute
@@ -3110,13 +4214,14 @@ def save_tetgen_files(mesh, base_path):
             # Write tetrahedra: index v1 v2 v3 v4
             for i, t in enumerate(mesh['tetrahedra']):
                 # Add 1 to convert to 1-indexed format
-                f.write(f"{i+1} {t[0]+1} {t[1]+1} {t[2]+1} {t[3]+1}\n")
-                
+                f.write(f"{i + 1} {t[0] + 1} {t[1] + 1} {t[2] + 1} {t[3] + 1}\n")
+
         logging.info(f"Saved TetGen files: {base_path}.node and {base_path}.ele")
         return True
     except Exception as e:
         logging.error(f"Error saving TetGen files: {e}")
         return False
+
 
 def save_netgen_vol(mesh, filepath):
     """Save mesh in NetGen .vol format"""
@@ -3125,26 +4230,27 @@ def save_netgen_vol(mesh, filepath):
             # Write header
             f.write("mesh3d\n")
             f.write("dimension\n3\n")
-            
+
             # Write points section
             f.write("points\n")
             f.write(f"{len(mesh['vertices'])}\n")
             for v in mesh['vertices']:
                 f.write(f"{v[0]:20.16f} {v[1]:20.16f} {v[2]:20.16f}\n")
-            
+
             # Write volumeelements section
             f.write("volumeelements\n")
             f.write(f"{len(mesh['tetrahedra'])}\n")
             for t in mesh['tetrahedra']:
                 # Format: type mat domain vol v1 v2 v3 v4
                 # Add 1 to convert to 1-indexed
-                f.write(f"1 1 1 0 {t[0]+1} {t[1]+1} {t[2]+1} {t[3]+1}\n")
-                
+                f.write(f"1 1 1 0 {t[0] + 1} {t[1] + 1} {t[2] + 1} {t[3] + 1}\n")
+
         logging.info(f"Saved NetGen .vol file: {filepath}")
         return True
     except Exception as e:
         logging.error(f"Error saving NetGen .vol file: {e}")
         return False
+
 
 def save_gmsh_msh(mesh, filepath):
     """Save mesh in GMsh .msh format"""
@@ -3152,14 +4258,14 @@ def save_gmsh_msh(mesh, filepath):
         with open(filepath, 'w') as f:
             # Write MSH format v2.2 header
             f.write("$MeshFormat\n2.2 0 8\n$EndMeshFormat\n")
-            
+
             # Write nodes
             f.write("$Nodes\n")
             f.write(f"{len(mesh['vertices'])}\n")
             for i, v in enumerate(mesh['vertices']):
-                f.write(f"{i+1} {v[0]} {v[1]} {v[2]}\n")
+                f.write(f"{i + 1} {v[0]} {v[1]} {v[2]}\n")
             f.write("$EndNodes\n")
-            
+
             # Write elements (tetrahedra)
             f.write("$Elements\n")
             f.write(f"{len(mesh['tetrahedra'])}\n")
@@ -3167,19 +4273,20 @@ def save_gmsh_msh(mesh, filepath):
                 # Format: elem_num elem_type tags v1 v2 v3 v4
                 # elem_type 4 = tetrahedral
                 # Add 1 to convert to 1-indexed
-                f.write(f"{i+1} 4 2 1 1 {t[0]+1} {t[1]+1} {t[2]+1} {t[3]+1}\n")
+                f.write(f"{i + 1} 4 2 1 1 {t[0] + 1} {t[1] + 1} {t[2] + 1} {t[3] + 1}\n")
             f.write("$EndElements\n")
-            
+
         logging.info(f"Saved GMsh .msh file: {filepath}")
         return True
     except Exception as e:
         logging.error(f"Error saving GMsh .msh file: {e}")
         return False
 
+
 def save_mesh_as_vtk(mesh, filename, binary=True):
     """
     Save a mesh to a legacy VTK file format with better error handling.
-    
+
     Parameters:
     -----------
     mesh : dict
@@ -3191,32 +4298,32 @@ def save_mesh_as_vtk(mesh, filename, binary=True):
     """
     try:
         logging.info(f"Saving mesh to {filename}...")
-        
+
         if not mesh or "vertices" not in mesh or "tetrahedra" not in mesh:
             logging.error("Invalid mesh data - missing vertices or tetrahedra")
             return False
-        
+
         # Create VTK data structures
         vtk_mesh = vtk.vtkUnstructuredGrid()
-        
+
         # Add points
         points = vtk.vtkPoints()
         for vertex in mesh["vertices"]:
             points.InsertNextPoint(vertex)
         vtk_mesh.SetPoints(points)
-        
+
         # Add tetrahedra
         for tet in mesh["tetrahedra"]:
             tetra = vtk.vtkTetra()
             for i in range(4):
                 tetra.GetPointIds().SetId(i, tet[i])
             vtk_mesh.InsertNextCell(tetra.GetCellType(), tetra.GetPointIds())
-            
+
         # Ensure directory exists
         directory = os.path.dirname(filename)
         if directory and not os.path.exists(directory):
             os.makedirs(directory)
-        
+
         # Save the file
         writer = vtk.vtkUnstructuredGridWriter()
         writer.SetFileName(filename)
@@ -3226,18 +4333,20 @@ def save_mesh_as_vtk(mesh, filename, binary=True):
         else:
             writer.SetFileTypeToASCII()
         writer.Write()
-        
-        logging.info(f"Mesh with {len(mesh['vertices'])} vertices and {len(mesh['tetrahedra'])} tetrahedra saved to {filename}")
+
+        logging.info(
+            f"Mesh with {len(mesh['vertices'])} vertices and {len(mesh['tetrahedra'])} tetrahedra saved to {filename}")
         return True
     except Exception as e:
         logging.error(f"Error saving mesh to VTK: {e}")
         traceback.print_exc()
         return False
 
+
 def save_mesh_with_scalars(mesh, scalars, filename):
     """
     Save a mesh with scalar values to a VTK file.
-    
+
     Parameters:
     -----------
     mesh : dict
@@ -3249,39 +4358,39 @@ def save_mesh_with_scalars(mesh, scalars, filename):
     """
     try:
         logging.info(f"Saving mesh with scalars to {filename}...")
-        
+
         # Create a VTK mesh object
         vtk_mesh = vtk.vtkUnstructuredGrid()
-        
+
         # Add points
         points = vtk.vtkPoints()
         for vertex in mesh["vertices"]:
             points.InsertNextPoint(vertex)
         vtk_mesh.SetPoints(points)
-        
+
         # Add tetrahedra
         for tet in mesh["tetrahedra"]:
             tetra = vtk.vtkTetra()
             for i in range(4):
                 tetra.GetPointIds().SetId(i, tet[i])
             vtk_mesh.InsertNextCell(tetra.GetCellType(), tetra.GetPointIds())
-        
+
         # Add scalar values as point data
         vtk_scalars = numpy_support.numpy_to_vtk(np.ascontiguousarray(scalars, dtype=np.float64))
         vtk_scalars.SetName("Scalar_Value")
         vtk_mesh.GetPointData().AddArray(vtk_scalars)
         vtk_mesh.GetPointData().SetActiveScalars("Scalar_Value")
-        
+
         # Write the mesh to a VTK file
         directory = os.path.dirname(filename)
         if not os.path.exists(directory):
             os.makedirs(directory)
-            
+
         writer = vtk.vtkXMLUnstructuredGridWriter()
         writer.SetFileName(filename)
         writer.SetInputData(vtk_mesh)
         writer.Write()
-        
+
         logging.info(f"Mesh with {len(scalars)} scalar values saved to {filename}")
         return True
     except Exception as e:
@@ -3289,60 +4398,61 @@ def save_mesh_with_scalars(mesh, scalars, filename):
         traceback.print_exc()
         return False
 
+
 def evaluate_mesh_quality(mesh, max_tetrahedra_to_check=10000):
     """
     Evaluate tetrahedral mesh quality with tet_collapse and volume_skew metrics
     as specified in Bachmann et al. (2022).
-    
+
     Parameters:
     -----------
     mesh : dict
         Mesh dictionary containing vertices and tetrahedra
     max_tetrahedra_to_check : int
         Maximum number of tetrahedra to check for very large meshes
-        
+
     Returns:
     --------
     tuple
         (tet_collapse, volume_skew) metrics
     """
     try:
-        #logging.info("Evaluating mesh quality...")
-        
+        # logging.info("Evaluating mesh quality...")
+
         if not mesh or "vertices" not in mesh or "tetrahedra" not in mesh:
             logging.error("Invalid mesh - missing vertices or tetrahedra")
             return 0, 1  # Worst quality values
-            
+
         vertices = mesh["vertices"]
         tetrahedra = mesh["tetrahedra"]
-        
+
         if len(tetrahedra) == 0:
             logging.warning("No tetrahedra found in mesh!")
             return 0, 1  # Worst quality values
-            
+
         # For large meshes, check a subset
         if len(tetrahedra) > max_tetrahedra_to_check:
-            indices = np.linspace(0, len(tetrahedra)-1, max_tetrahedra_to_check).astype(int)
+            indices = np.linspace(0, len(tetrahedra) - 1, max_tetrahedra_to_check).astype(int)
             tetrahedra_subset = tetrahedra[indices]
         else:
             tetrahedra_subset = tetrahedra
-            
+
         # Calculate tet_collapse metric (ranges from 0 for collapsed to 1 for optimal)
         # Formula based on MSC.Software - ratio of height to face area
         tet_collapse_values = []
-        
+
         # Calculate volume_skew metric (ranges from 0 for equilateral to 1 for degenerated)
         # Formula: deviation from equilateral tetrahedron volume
         volume_skew_values = []
-        
+
         # Ideal volume ratio for equilateral tetrahedron
-        equilateral_volume_ratio = np.sqrt(2)/12
-        
+        equilateral_volume_ratio = np.sqrt(2) / 12
+
         for tet in tetrahedra_subset:
             try:
                 # Get vertices
                 v0, v1, v2, v3 = vertices[tet[0]], vertices[tet[1]], vertices[tet[2]], vertices[tet[3]]
-                
+
                 # Calculate edge vectors
                 e01 = v1 - v0
                 e02 = v2 - v0
@@ -3350,7 +4460,7 @@ def evaluate_mesh_quality(mesh, max_tetrahedra_to_check=10000):
                 e12 = v2 - v1
                 e13 = v3 - v1
                 e23 = v3 - v2
-                
+
                 # Calculate edge lengths
                 edges = [
                     np.linalg.norm(e01),
@@ -3360,10 +4470,10 @@ def evaluate_mesh_quality(mesh, max_tetrahedra_to_check=10000):
                     np.linalg.norm(e13),
                     np.linalg.norm(e23)
                 ]
-                
+
                 # Calculate volume
                 volume = np.abs(np.dot(np.cross(e01, e02), e03)) / 6
-                
+
                 if volume > 0:
                     # Calculate face areas for tet_collapse
                     # Face areas
@@ -3371,67 +4481,68 @@ def evaluate_mesh_quality(mesh, max_tetrahedra_to_check=10000):
                     a1 = 0.5 * np.linalg.norm(np.cross(e02, e03))  # Face opposite v1
                     a2 = 0.5 * np.linalg.norm(np.cross(e01, e03))  # Face opposite v2
                     a3 = 0.5 * np.linalg.norm(np.cross(e01, e02))  # Face opposite v3
-                    
+
                     # Heights from each vertex to opposite face
                     h0 = 3 * volume / a0 if a0 > 0 else 0
                     h1 = 3 * volume / a1 if a1 > 0 else 0
                     h2 = 3 * volume / a2 if a2 > 0 else 0
                     h3 = 3 * volume / a3 if a3 > 0 else 0
-                    
+
                     # Calculate min height / max face area ratio
                     heights = [h0, h1, h2, h3]
                     areas = [a0, a1, a2, a3]
-                    
+
                     # Avoid division by zero
                     min_height = min(heights) if any(h > 0 for h in heights) else 0
                     max_area = max(areas) if any(a > 0 for a in areas) else 1
-                    
+
                     # Normalize to [0,1] range where 1 is optimal
                     # For regular tetrahedron, height/area = √6/2
-                    ideal_ratio = np.sqrt(6)/2
+                    ideal_ratio = np.sqrt(6) / 2
                     actual_ratio = min_height / max_area if max_area > 0 else 0
-                    
+
                     # Normalize to [0,1] (0 = collapsed, 1 = optimal)
                     tet_collapse = min(actual_ratio / ideal_ratio, 1.0) if ideal_ratio > 0 else 0
                     tet_collapse_values.append(tet_collapse)
-                    
+
                     # Calculate volume_skew
                     # Maximum edge length
                     max_edge = max(edges)
-                    
+
                     # Volume of equilateral tetrahedron with same max edge length
-                    equilateral_volume = equilateral_volume_ratio * (max_edge**3)
-                    
+                    equilateral_volume = equilateral_volume_ratio * (max_edge ** 3)
+
                     # Deviation from equilateral (0 = equilateral, 1 = degenerated)
                     volume_skew = 1.0 - min(volume / equilateral_volume, 1.0) if equilateral_volume > 0 else 1.0
                     volume_skew_values.append(volume_skew)
-                    
+
             except Exception as e:
                 logging.warning(f"Error evaluating tetrahedron: {e}")
                 continue
-        
+
         # Average the metrics
         if tet_collapse_values:
             avg_tet_collapse = np.mean(tet_collapse_values)
         else:
             avg_tet_collapse = 0
-            
+
         if volume_skew_values:
             avg_volume_skew = np.mean(volume_skew_values)
         else:
             avg_volume_skew = 1
-        
-        #logging.info(f"Mesh quality metrics:")
-        #logging.info(f"  Tet collapse: {avg_tet_collapse:.4f} (higher is better, 1.0 is optimal)")
-        #logging.info(f"  Volume skew: {avg_volume_skew:.4f} (lower is better, 0.0 is optimal)")
-        
+
+        # logging.info(f"Mesh quality metrics:")
+        # logging.info(f"  Tet collapse: {avg_tet_collapse:.4f} (higher is better, 1.0 is optimal)")
+        # logging.info(f"  Volume skew: {avg_volume_skew:.4f} (lower is better, 0.0 is optimal)")
+
         return avg_tet_collapse, avg_volume_skew
-        
+
     except Exception as e:
         logging.error(f"Error evaluating mesh quality: {e}")
         import traceback
         traceback.print_exc()
         return 0, 1  # Return worst quality values
+
 
 def similarity_registration(fixed_image, moving_image):
     """Perform similarity registration that preserves bone structure."""
@@ -3439,51 +4550,54 @@ def similarity_registration(fixed_image, moving_image):
         # Convert images to float for registration
         fixed_image = sitk.Cast(fixed_image, sitk.sitkFloat32)
         moving_image = sitk.Cast(moving_image, sitk.sitkFloat32)
-        
+
         # Log initial statistics to verify content
         fixed_stats = sitk.StatisticsImageFilter()
         moving_stats = sitk.StatisticsImageFilter()
         fixed_stats.Execute(fixed_image)
         moving_stats.Execute(moving_image)
-        
+
         logging.info(f"Registration input - Fixed: Min={fixed_stats.GetMinimum()}, "
-                    f"Max={fixed_stats.GetMaximum()}, Mean={fixed_stats.GetMean():.4f}")
+                     f"Max={fixed_stats.GetMaximum()}, Mean={fixed_stats.GetMean():.4f}")
         logging.info(f"Registration input - Moving: Min={moving_stats.GetMinimum()}, "
-                    f"Max={moving_stats.GetMaximum()}, Mean={moving_stats.GetMean():.4f}")
-        
+                     f"Max={moving_stats.GetMaximum()}, Mean={moving_stats.GetMean():.4f}")
+
         # Initialize transform
         initial_transform = sitk.CenteredTransformInitializer(
-            fixed_image, 
+            fixed_image,
             moving_image,
             sitk.Similarity3DTransform(),
             sitk.CenteredTransformInitializerFilter.GEOMETRY
         )
-        
+
         # Configure registration
         registration_method = sitk.ImageRegistrationMethod()
         registration_method.SetMetricAsCorrelation()
+        #registration_method.SetMetricAsMeanSquares()
+        #registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
         registration_method.SetInterpolator(sitk.sitkNearestNeighbor)
         registration_method.SetInitialTransform(initial_transform, inPlace=False)
-        
+
         # Simplified optimizer settings
         registration_method.SetOptimizerAsGradientDescent(
             learningRate=0.1,
             numberOfIterations=100
         )
-        
+
         # Execute registration
         final_transform = registration_method.Execute(fixed_image, moving_image)
-        
+
         # Log metric value
         metric_value = registration_method.GetMetricValue()
         logging.info(f"Registration completed - Metric value: {metric_value:.6f}")
-        
+
         return final_transform
-        
+
     except Exception as e:
         logging.error(f"Error in similarity registration: {e}")
         traceback.print_exc()
         return None
+
 
 def create_confined_background_grid(image, grid_spacing=2.5):
     """Create background grid confined to the bone region only."""
@@ -3493,62 +4607,63 @@ def create_confined_background_grid(image, grid_spacing=2.5):
         indices = np.nonzero(array)
         z_min, y_min, x_min = np.min(indices, axis=1)
         z_max, y_max, x_max = np.max(indices, axis=1)
-        
+
         # Add small margin around the bone
         margin = int(grid_spacing / image.GetSpacing()[0])
         x_min = max(0, x_min - margin)
         y_min = max(0, y_min - margin)
         z_min = max(0, z_min - margin)
-        x_max = min(image.GetSize()[0]-1, x_max + margin)
-        y_max = min(image.GetSize()[1]-1, y_max + margin)
-        z_max = min(image.GetSize()[2]-1, z_max + margin)
-        
+        x_max = min(image.GetSize()[0] - 1, x_max + margin)
+        y_max = min(image.GetSize()[1] - 1, y_max + margin)
+        z_max = min(image.GetSize()[2] - 1, z_max + margin)
+
         # Convert to physical coordinates
         origin = image.GetOrigin()
         spacing = image.GetSpacing()
-        
+
         # Calculate grid points
         grid_points = []
-        for z in np.arange(z_min, z_max+1, grid_spacing/spacing[2]):
-            for y in np.arange(y_min, y_max+1, grid_spacing/spacing[1]):
-                for x in np.arange(x_min, x_max+1, grid_spacing/spacing[0]):
+        for z in np.arange(z_min, z_max + 1, grid_spacing / spacing[2]):
+            for y in np.arange(y_min, y_max + 1, grid_spacing / spacing[1]):
+                for x in np.arange(x_min, x_max + 1, grid_spacing / spacing[0]):
                     # Convert to physical coordinates
                     px = origin[0] + x * spacing[0]
                     py = origin[1] + y * spacing[1]
                     pz = origin[2] + z * spacing[2]
                     grid_points.append([px, py, pz])
-        
+
         return np.array(grid_points)
     else:
         return None
 
+
 def align_mesh_to_image(mesh_dict, image, output_dir=None):
     """
     Enhanced mesh alignment function that works with Dragonfly-exported meshes.
-    
+
     This function handles the scale and coordinate system differences between
     a mesh exported from Dragonfly and the SimpleITK image space.
     """
     try:
         logging.info("Starting advanced mesh-to-image alignment...")
-        
+
         # Get image properties
         size = image.GetSize()
         spacing = image.GetSpacing()
         origin = image.GetOrigin()
         direction = image.GetDirection()
-        
+
         # Calculate image physical boundaries
         physical_dims = [size[i] * spacing[i] for i in range(3)]
-        image_center = [origin[i] + physical_dims[i]/2 for i in range(3)]
-        
+        image_center = [origin[i] + physical_dims[i] / 2 for i in range(3)]
+
         # Extract non-zero region from image (bone content)
         array = sitk.GetArrayFromImage(image)
         if np.sum(array) > 0:
             indices = np.nonzero(array)
             z_min, y_min, x_min = np.min(indices, axis=1)
             z_max, y_max, x_max = np.max(indices, axis=1)
-            
+
             # Convert to physical coordinates (SimpleITK uses x,y,z ordering)
             content_min = [
                 origin[0] + x_min * spacing[0],
@@ -3560,113 +4675,114 @@ def align_mesh_to_image(mesh_dict, image, output_dir=None):
                 origin[1] + y_max * spacing[1],
                 origin[2] + z_max * spacing[2]
             ]
-            content_center = [(content_min[i] + content_max[i])/2 for i in range(3)]
+            content_center = [(content_min[i] + content_max[i]) / 2 for i in range(3)]
             content_dims = [content_max[i] - content_min[i] for i in range(3)]
-            
+
         else:
             logging.warning("Image appears empty. Using full image bounds.")
             content_center = image_center
             content_dims = physical_dims
-        
+
         # Get mesh properties
         mesh_vertices = mesh_dict['vertices']
         mesh_min = np.min(mesh_vertices, axis=0)
         mesh_max = np.max(mesh_vertices, axis=0)
         mesh_center = (mesh_min + mesh_max) / 2
         mesh_dims = mesh_max - mesh_min
-        
+
         # Calculate scaling factors based on physical dimensions
         # Use minimum scaling to preserve aspect ratio
         scale_factors = [content_dims[i] / mesh_dims[i] for i in range(3)]
-        #logging.info(f"Scaling factors: {scale_factors}")
-        
+        # logging.info(f"Scaling factors: {scale_factors}")
+
         uniform_scale = min(scale_factors) * 0.98  # Slight reduction to ensure fit
-        #logging.info(f"Using uniform scale factor: {uniform_scale}")
-        
+        # logging.info(f"Using uniform scale factor: {uniform_scale}")
+
         # Transform vertices: scale and translate
         transformed_vertices = np.copy(mesh_vertices)
-        
+
         # Center the mesh at origin
         transformed_vertices -= mesh_center
-        
+
         # Scale uniformly
         transformed_vertices *= uniform_scale
-        
+
         # Translate to content center
         transformed_vertices += content_center
-        
+
         transformed_mesh = {
             'vertices': transformed_vertices,
             'tetrahedra': mesh_dict['tetrahedra'].copy()
         }
-        
+
         # Save visualization if requested
         if output_dir:
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
-            
+
             # Save meshes before and after transformation
-            #save_mesh_as_vtk(mesh_dict, os.path.join(output_dir, 'original_mesh.vtk'))
-            #save_mesh_as_vtk(transformed_mesh, os.path.join(output_dir, 'aligned_mesh.vtk'))
-            
+            # save_mesh_as_vtk(mesh_dict, os.path.join(output_dir, 'original_mesh.vtk'))
+            # save_mesh_as_vtk(transformed_mesh, os.path.join(output_dir, 'aligned_mesh.vtk'))
+
             # Visualize alignment
             import matplotlib.pyplot as plt
             from mpl_toolkits.mplot3d import Axes3D
-            
+
             fig = plt.figure(figsize=(12, 10))
             ax = fig.add_subplot(111, projection='3d')
-            
+
             # Sample points for visualization (to avoid plotting all vertices)
             sample_size = min(1000, len(mesh_vertices))
             indices = np.random.choice(len(mesh_vertices), sample_size, replace=False)
-            
+
             # Plot original and transformed vertices
             ax.scatter(
-                mesh_vertices[indices, 0], 
-                mesh_vertices[indices, 1], 
-                mesh_vertices[indices, 2], 
+                mesh_vertices[indices, 0],
+                mesh_vertices[indices, 1],
+                mesh_vertices[indices, 2],
                 c='red', alpha=0.5, label='Original Mesh'
             )
             ax.scatter(
-                transformed_vertices[indices, 0], 
-                transformed_vertices[indices, 1], 
-                transformed_vertices[indices, 2], 
+                transformed_vertices[indices, 0],
+                transformed_vertices[indices, 1],
+                transformed_vertices[indices, 2],
                 c='blue', alpha=0.5, label='Aligned Mesh'
             )
-            
+
             # Plot content bounds as box
             def plot_box(min_coords, max_coords, color='k'):
                 x_min, y_min, z_min = min_coords
                 x_max, y_max, z_max = max_coords
-                
+
                 # Draw box edges
-                for x, y, z in [(x_min, y_min, z_min), (x_max, y_min, z_min), 
-                              (x_max, y_max, z_min), (x_min, y_max, z_min)]:
+                for x, y, z in [(x_min, y_min, z_min), (x_max, y_min, z_min),
+                                (x_max, y_max, z_min), (x_min, y_max, z_min)]:
                     ax.plot([x, x], [y, y], [z_min, z_max], color)
-                
+
                 for z in [z_min, z_max]:
-                    ax.plot([x_min, x_max, x_max, x_min, x_min], 
-                           [y_min, y_min, y_max, y_max, y_min], 
-                           [z, z, z, z, z], color)
-            
+                    ax.plot([x_min, x_max, x_max, x_min, x_min],
+                            [y_min, y_min, y_max, y_max, y_min],
+                            [z, z, z, z, z], color)
+
             plot_box(content_min, content_max)
-            
+
             ax.set_xlabel('X (mm)')
             ax.set_ylabel('Y (mm)')
             ax.set_zlabel('Z (mm)')
             ax.set_title('Mesh Alignment with Content Bounds')
             ax.legend()
-            
+
             plt.savefig(os.path.join(output_dir, 'mesh_alignment_visualization.png'), dpi=600)
             plt.close()
-        
+
         logging.info(f"Mesh alignment completed successfully")
         return transformed_mesh
-        
+
     except Exception as e:
         logging.error(f"Error in mesh alignment: {e}")
         traceback.print_exc()
         return mesh_dict  # Return original as fallback
+
 
 def displace(mesh, displacement_field, sigma=1.0):
     # Get vector displacement array [Z, Y, X, 3]
@@ -3698,17 +4814,17 @@ def displace(mesh, displacement_field, sigma=1.0):
     }
 
 
-def isomorph(mesh, canonical_image, individual_image, transforms_dir, condyle_name, iteration, debug_dir=None):
+def isomorph(mesh, canonical_image, individual_image, transforms_dir, bone_name, iteration, debug_dir=None):
     """Enhanced function to morph canonical mesh to individual trabecular space."""
-    
-    bspline_transform = find_transforms_for_condyle(
-        transforms_dir, 
-        condyle_name, 
+
+    bspline_transform = find_transforms_for_bone(
+        transforms_dir,
+        bone_name,
         iteration
     )
 
-    #mesh = align_mesh_to_image(mesh, canonical_image, output_dir = "B:/")
-    
+    # mesh = align_mesh_to_image(mesh, canonical_image, output_dir = "B:/")
+
     displacement_field = sitk.TransformToDisplacementField(
         bspline_transform,
         sitk.sitkVectorFloat64,
@@ -3722,15 +4838,15 @@ def isomorph(mesh, canonical_image, individual_image, transforms_dir, condyle_na
     smoothed_components = [sitk.DiscreteGaussian(comp, 1) for comp in displacement_components]
     vector_components = [sitk.Cast(comp, sitk.sitkFloat64) for comp in smoothed_components]
     smoothed_field = sitk.Compose(vector_components)
-    #bspline_transform = sitk.DisplacementFieldTransform(smoothed_field)
+    # bspline_transform = sitk.DisplacementFieldTransform(smoothed_field)
 
     inverted_field = sitk.InvertDisplacementField(
-                smoothed_field,
-                maximumNumberOfIterations=150,
-                meanErrorToleranceThreshold=0.01,
-                maxErrorToleranceThreshold=0.05,
-                enforceBoundaryCondition=True
-            )
+        smoothed_field,
+        maximumNumberOfIterations=150,
+        meanErrorToleranceThreshold=0.01,
+        maxErrorToleranceThreshold=0.05,
+        enforceBoundaryCondition=True
+    )
 
     bspline_transform = sitk.DisplacementFieldTransform(inverted_field)
 
@@ -3744,9 +4860,10 @@ def isomorph(mesh, canonical_image, individual_image, transforms_dir, condyle_na
         'tetrahedra': mesh['tetrahedra'].copy()
     }
 
-    #morphed_mesh = align_mesh_to_image(morphed_mesh, individual_image, output_dir = "B:/")
+    # morphed_mesh = align_mesh_to_image(morphed_mesh, individual_image, output_dir = "B:/")
 
     return morphed_mesh
+
 
 def hma(trabecular_image, mesh, grid_spacing=2.5, sphere_diameter=5.0, output_dir=None):
     """
@@ -3754,49 +4871,49 @@ def hma(trabecular_image, mesh, grid_spacing=2.5, sphere_diameter=5.0, output_di
     """
     try:
         logging.info("Starting improved holistic morphometric analysis...")
-        
+
         # First, verify the mesh and image alignment
         logging.info("Verifying mesh alignment with image...")
         mesh_vertices = mesh['vertices']
-        
+
         # Get image properties
         spacing = trabecular_image.GetSpacing()
         size = trabecular_image.GetSize()
         origin = trabecular_image.GetOrigin()
-        
+
         # Calculate image physical boundaries
         image_bounds = [
             origin[0], origin[0] + size[0] * spacing[0],
             origin[1], origin[1] + size[1] * spacing[1],
             origin[2], origin[2] + size[2] * spacing[2]
         ]
-        
+
         # Get mesh boundaries
         mesh_min = np.min(mesh_vertices, axis=0)
         mesh_max = np.max(mesh_vertices, axis=0)
-        
+
         # Check if mesh is contained within image bounds
         mesh_contained = (
-            mesh_min[0] >= image_bounds[0] and mesh_max[0] <= image_bounds[1] and
-            mesh_min[1] >= image_bounds[2] and mesh_max[1] <= image_bounds[3] and
-            mesh_min[2] >= image_bounds[4] and mesh_max[2] <= image_bounds[5]
+                mesh_min[0] >= image_bounds[0] and mesh_max[0] <= image_bounds[1] and
+                mesh_min[1] >= image_bounds[2] and mesh_max[1] <= image_bounds[3] and
+                mesh_min[2] >= image_bounds[4] and mesh_max[2] <= image_bounds[5]
         )
-        
+
         if not mesh_contained:
             logging.warning("Mesh extends outside image bounds! This may affect results.")
             logging.warning(f"Image bounds: {image_bounds}")
             logging.warning(f"Mesh bounds: {mesh_min.tolist()} to {mesh_max.tolist()}")
-        
+
         # Create background grid with appropriate dimensions
         logging.info(f"Creating background grid with {grid_spacing}mm spacing...")
-        
+
         # Calculate number of grid points
         n_grid_x = max(2, int((image_bounds[1] - image_bounds[0]) / grid_spacing) + 1)
         n_grid_y = max(2, int((image_bounds[3] - image_bounds[2]) / grid_spacing) + 1)
         n_grid_z = max(2, int((image_bounds[5] - image_bounds[4]) / grid_spacing) + 1)
-        
+
         logging.info(f"Grid dimensions: {n_grid_x} x {n_grid_y} x {n_grid_z} points")
-        
+
         # Create grid points
         grid_points = []
         for k in range(n_grid_z):
@@ -3806,73 +4923,73 @@ def hma(trabecular_image, mesh, grid_spacing=2.5, sphere_diameter=5.0, output_di
                 for i in range(n_grid_x):
                     x = image_bounds[0] + i * grid_spacing
                     grid_points.append([x, y, z])
-        
+
         grid_points = np.array(grid_points)
         logging.info(f"Created background grid with {len(grid_points)} points")
-        
+
         # Convert image to numpy array
         np_array = sitk.GetArrayFromImage(trabecular_image)
-        
+
         # Calculate BV/TV at each grid point
         logging.info("Calculating BV/TV at grid points...")
         bv_tv_values = np.zeros(len(grid_points))
         fabric_tensors = np.zeros((len(grid_points), 3, 3))
-        
+
         # Calculate sphere radius in voxels
         radius_voxels = [sphere_diameter / (2.0 * spacing[i]) for i in range(3)]
-        
+
         # Process in batches
         batch_size = 100
         num_batches = (len(grid_points) + batch_size - 1) // batch_size
-        
+
         for batch in range(num_batches):
             start_idx = batch * batch_size
             end_idx = min((batch + 1) * batch_size, len(grid_points))
-            
+
             if batch % 10 == 0:
-                logging.info(f"Processing grid batch {batch+1}/{num_batches}")
-            
+                logging.info(f"Processing grid batch {batch + 1}/{num_batches}")
+
             for i in range(start_idx, end_idx):
                 point = grid_points[i]
-                
+
                 # Convert to voxel coordinates
                 idx_x = int((point[0] - origin[0]) / spacing[0])
                 idx_y = int((point[1] - origin[1]) / spacing[1])
                 idx_z = int((point[2] - origin[2]) / spacing[2])
-                
+
                 # Check if within image bounds
                 if (0 <= idx_x < size[0] and 0 <= idx_y < size[1] and 0 <= idx_z < size[2]):
                     # Define sampling sphere
                     x_min = max(0, int(idx_x - radius_voxels[0]))
-                    x_max = min(size[0]-1, int(idx_x + radius_voxels[0]))
+                    x_max = min(size[0] - 1, int(idx_x + radius_voxels[0]))
                     y_min = max(0, int(idx_y - radius_voxels[1]))
-                    y_max = min(size[1]-1, int(idx_y + radius_voxels[1]))
+                    y_max = min(size[1] - 1, int(idx_y + radius_voxels[1]))
                     z_min = max(0, int(idx_z - radius_voxels[2]))
-                    z_max = min(size[2]-1, int(idx_z + radius_voxels[2]))
-                    
+                    z_max = min(size[2] - 1, int(idx_z + radius_voxels[2]))
+
                     # Skip if sphere is outside image
                     if x_min >= x_max or y_min >= y_max or z_min >= z_max:
                         continue
-                    
+
                     # Extract region (numpy array is Z,Y,X)
-                    region = np_array[z_min:z_max+1, y_min:y_max+1, x_min:x_max+1]
-                    
+                    region = np_array[z_min:z_max + 1, y_min:y_max + 1, x_min:x_max + 1]
+
                     # Calculate BV/TV
                     total_voxels = region.size
                     bone_voxels = np.sum(region > 0)
-                    
+
                     if total_voxels > 0:
                         bv_tv = bone_voxels / total_voxels
                     else:
                         bv_tv = 0
-                        
+
                     bv_tv_values[i] = bv_tv
-                    
+
                     # Calculate fabric tensor if enough bone
                     if bone_voxels > 10 and region.shape[0] > 2 and region.shape[1] > 2 and region.shape[2] > 2:
                         # Calculate structure tensor using image gradients
                         gz, gy, gx = np.gradient(region.astype(float))
-                        
+
                         fabric = np.zeros((3, 3))
                         fabric[0, 0] = np.mean(gx * gx)  # xx
                         fabric[0, 1] = fabric[1, 0] = np.mean(gx * gy)  # xy/yx
@@ -3880,131 +4997,130 @@ def hma(trabecular_image, mesh, grid_spacing=2.5, sphere_diameter=5.0, output_di
                         fabric[1, 1] = np.mean(gy * gy)  # yy
                         fabric[1, 2] = fabric[2, 1] = np.mean(gy * gz)  # yz/zy
                         fabric[2, 2] = np.mean(gz * gz)  # zz
-                        
+
                         # Ensure positive definiteness
                         evals, evecs = np.linalg.eigh(fabric)
                         if np.any(evals < 0):
-
                             evals[evals < 1e-6] = 1e-6
-                            #evals = np.abs(evals)
+                            # evals = np.abs(evals)
                             fabric = evecs @ np.diag(evals) @ evecs.T
-                            
+
                         fabric_tensors[i] = fabric
                     else:
                         # Default to isotropic tensor for regions with little/no bone
                         fabric_tensors[i] = np.eye(3)
-        
+
         # Create KD-tree for interpolation
         logging.info("Interpolating values to mesh vertices...")
         from scipy.spatial import cKDTree
         tree = cKDTree(grid_points)
-        
+
         # Interpolate to mesh vertices
         vertex_bv_tv = np.zeros(len(mesh_vertices))
         vertex_fabric = np.zeros((len(mesh_vertices), 3, 3))
-        
+
         # Process in batches
         vertex_batch_size = 10000
         num_batches = (len(mesh_vertices) + vertex_batch_size - 1) // vertex_batch_size
-        
+
         for batch in range(num_batches):
             start_idx = batch * vertex_batch_size
             end_idx = min((batch + 1) * vertex_batch_size, len(mesh_vertices))
-            
+
             if batch % 5 == 0:
-                logging.info(f"Processing vertex batch {batch+1}/{num_batches}")
-            
+                logging.info(f"Processing vertex batch {batch + 1}/{num_batches}")
+
             batch_vertices = mesh_vertices[start_idx:end_idx]
-            
+
             # Find nearest neighbors for interpolation (k=8 for trilinear)
             k = 8
             distances, indices = tree.query(batch_vertices, k=k)
-            
+
             # Calculate interpolation weights (inverse distance)
             weights = 1.0 / (distances + 1e-10)
             weights = weights / np.sum(weights, axis=1, keepdims=True)
-            
+
             # Interpolate BV/TV and fabric tensor
             for i in range(end_idx - start_idx):
                 # BV/TV interpolation
                 vertex_bv_tv[start_idx + i] = np.sum(weights[i] * bv_tv_values[indices[i]])
-                
+
                 # Fabric tensor interpolation
                 for j in range(k):
                     vertex_fabric[start_idx + i] += weights[i, j] * fabric_tensors[indices[i, j]]
-        
+
         # Calculate element values from vertex values
         logging.info("Computing element-wise values...")
         element_bv_tv = np.zeros(len(mesh['tetrahedra']))
         element_fabric = np.zeros((len(mesh['tetrahedra']), 3, 3))
-        
+
         for i, tet in enumerate(mesh['tetrahedra']):
             # Calculate element centroid
             centroid = np.mean(mesh_vertices[tet], axis=0)
-            
+
             # Find nearest grid point
             _, idx = tree.query(centroid, k=1)
-            
+
             # Assign values
             element_bv_tv[i] = bv_tv_values[idx]
             element_fabric[i] = fabric_tensors[idx]
-        
+
         # Calculate mean BV/TV (exclude empty regions)
         valid_bv_tv = vertex_bv_tv[vertex_bv_tv > 0.01]
         if len(valid_bv_tv) > 0:
             mean_bv_tv = np.mean(valid_bv_tv)
         else:
             mean_bv_tv = 0.001  # Fallback
-        
+
         # Calculate relative BV/TV
         vertex_r_bv_tv = vertex_bv_tv / mean_bv_tv if mean_bv_tv > 0 else np.zeros_like(vertex_bv_tv)
         element_r_bv_tv = element_bv_tv / mean_bv_tv if mean_bv_tv > 0 else np.zeros_like(element_bv_tv)
-        
+
         # Calculate degree of anisotropy
         vertex_da = np.ones(len(mesh_vertices))  # Default to isotropic
         element_da = np.ones(len(mesh['tetrahedra']))
-        
+
         for i in range(len(mesh_vertices)):
             try:
                 evals, _ = np.linalg.eigh(vertex_fabric[i])
                 evals[evals < 1e-6] = 1e-6
-                #evals = np.abs(evals)  # Ensure positive
+                # evals = np.abs(evals)  # Ensure positive
                 evals = np.sort(evals)  # Sort ascending
-                
+
                 if evals[0] > 1e-6:
                     vertex_da[i] = evals[2] / evals[0]  # DA = λ₁/λ₃
             except:
                 pass  # Keep default value
-        
+
         for i in range(len(mesh['tetrahedra'])):
             try:
                 evals, _ = np.linalg.eigh(element_fabric[i])
                 evals[evals < 1e-6] = 1e-6
-                #evals = np.abs(evals)
+                # evals = np.abs(evals)
                 evals = np.sort(evals)
-                
+
                 if evals[0] > 1e-6:
                     element_da[i] = evals[2] / evals[0]
             except:
                 pass
-        
+
         # Calculate mean DA
         valid_da = vertex_da[(vertex_da > 1.0) & (vertex_da < 10.0)]
         mean_da = np.mean(valid_da) if len(valid_da) > 0 else 1.0
-        
+
         # Calculate relative DA
         vertex_r_da = vertex_da / mean_da if mean_da > 0 else np.ones_like(vertex_da)
         element_r_da = element_da / mean_da if mean_da > 0 else np.ones_like(element_da)
-        
+
         # 11. Visualize results if output directory is provided
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
-            
+
             # Visualize background grid with BV/TV values
             if len(grid_points) > 0:
                 import matplotlib.pyplot as plt
                 from mpl_toolkits.mplot3d import Axes3D
-                
+
                 # Plot with randomly sampled points to avoid overplotting
                 max_points = 5000
                 if len(grid_points) > max_points:
@@ -4014,22 +5130,22 @@ def hma(trabecular_image, mesh, grid_spacing=2.5, sphere_diameter=5.0, output_di
                 else:
                     sample_points = grid_points
                     sample_values = bv_tv_values
-                
+
                 fig = plt.figure(figsize=(12, 10))
                 ax = fig.add_subplot(111, projection='3d')
-                
+
                 sc = ax.scatter(sample_points[:, 0], sample_points[:, 1], sample_points[:, 2],
-                              c=sample_values, cmap='viridis', alpha=0.5, s=10)
-                
+                                c=sample_values, cmap='viridis', alpha=0.5, s=10)
+
                 plt.colorbar(sc, ax=ax, label='BV/TV')
                 ax.set_xlabel('X (mm)')
                 ax.set_ylabel('Y (mm)')
                 ax.set_zlabel('Z (mm)')
                 ax.set_title('Background Grid BV/TV Values')
-                
+
                 plt.savefig(os.path.join(output_dir, 'background_grid_bvtv.png'), dpi=600)
                 plt.close()
-                
+
                 # Visualize mesh vertices with BV/TV values
                 if len(mesh_vertices) > max_points:
                     idx = np.random.choice(len(mesh_vertices), max_points, replace=False)
@@ -4038,33 +5154,33 @@ def hma(trabecular_image, mesh, grid_spacing=2.5, sphere_diameter=5.0, output_di
                 else:
                     sample_vertices = mesh_vertices
                     sample_bvtv = vertex_bv_tv
-                
+
                 fig = plt.figure(figsize=(12, 10))
                 ax = fig.add_subplot(111, projection='3d')
-                
+
                 sc = ax.scatter(sample_vertices[:, 0], sample_vertices[:, 1], sample_vertices[:, 2],
-                              c=sample_bvtv, cmap='viridis', alpha=0.5, s=10)
-                
+                                c=sample_bvtv, cmap='viridis', alpha=0.5, s=10)
+
                 plt.colorbar(sc, ax=ax, label='BV/TV')
                 ax.set_xlabel('X (mm)')
                 ax.set_ylabel('Y (mm)')
                 ax.set_zlabel('Z (mm)')
                 ax.set_title('Mesh Vertices BV/TV Values')
-                
+
                 plt.savefig(os.path.join(output_dir, 'mesh_vertices_bvtv.png'), dpi=600)
                 plt.close()
-                
+
                 # Also save cross-sections of the original image for reference
                 array = sitk.GetArrayFromImage(trabecular_image)
                 middle_z = array.shape[0] // 2
-                
+
                 plt.figure(figsize=(10, 8))
                 plt.imshow(array[middle_z, :, :], cmap='gray')
                 plt.title(f'Binary Image (Z-slice {middle_z})')
                 plt.colorbar(label='Intensity')
                 plt.savefig(os.path.join(output_dir, 'trabecular_image_z_slice.png'), dpi=300)
                 plt.close()
-                
+
                 middle_y = array.shape[1] // 2
                 plt.figure(figsize=(10, 8))
                 plt.imshow(array[:, middle_y, :], cmap='gray')
@@ -4072,7 +5188,7 @@ def hma(trabecular_image, mesh, grid_spacing=2.5, sphere_diameter=5.0, output_di
                 plt.colorbar(label='Intensity')
                 plt.savefig(os.path.join(output_dir, 'trabecular_image_y_slice.png'), dpi=300)
                 plt.close()
-        
+
         # 12. Create result dictionary
         result = {
             'vertex_bv_tv': vertex_bv_tv,
@@ -4088,20 +5204,21 @@ def hma(trabecular_image, mesh, grid_spacing=2.5, sphere_diameter=5.0, output_di
             'mean_bv_tv': mean_bv_tv,
             'mean_da': mean_da
         }
-        
+
         logging.info(f"HMA completed successfully. Mean BV/TV: {mean_bv_tv:.6f}, Mean DA: {mean_da:.6f}")
-        
+
         return result
-        
+
     except Exception as e:
         logging.error(f"Error in holistic morphometric analysis: {e}")
         traceback.print_exc()
         return None
 
+
 def improved_hma(trabecular_image, mesh, grid_spacing=1.5, sphere_diameter=3.0, output_dir=None):
     """
     Improved holistic morphometric analysis following Bachmann et al. 2022.
-    
+
     Parameters:
     -----------
     trabecular_image : sitk.Image
@@ -4114,7 +5231,7 @@ def improved_hma(trabecular_image, mesh, grid_spacing=1.5, sphere_diameter=3.0, 
         Diameter of sampling sphere in mm (default: 3 mm)
     output_dir : str, optional
         Directory to save debug visualizations
-        
+
     Returns:
     --------
     dict
@@ -4122,53 +5239,53 @@ def improved_hma(trabecular_image, mesh, grid_spacing=1.5, sphere_diameter=3.0, 
     """
     try:
         logging.info("Starting improved holistic morphometric analysis...")
-        
+
         # Step 1: Create background grid confined to bone region
         grid_points = create_confined_background_grid(
-            trabecular_image, 
+            trabecular_image,
             grid_spacing=grid_spacing
         )
-        
+
         if grid_points is None or len(grid_points) == 0:
             logging.error("Failed to create background grid")
             return None
-        
+
         # Step 2: Calculate BV/TV and anisotropy at grid points
         grid_values = calculate_bvtv_and_anisotropy_at_grid_points(
             trabecular_image,
             grid_points,
             sphere_diameter=sphere_diameter
         )
-        
+
         if grid_values is None:
             logging.error("Failed to calculate BV/TV and anisotropy at grid points")
             return None
-        
+
         # Step 3: Create bone presence mask
         bone_mask = create_bone_presence_mask(trabecular_image, mesh)
-        
+
         # Step 4: Calculate confidence scores
         confidence_scores = calculate_confidence_scores(
-            mesh, 
-            trabecular_image, 
-            grid_points, 
+            mesh,
+            trabecular_image,
+            grid_points,
             grid_values
         )
-        
+
         # Step 5: Interpolate values to mesh vertices
         mesh_values = interpolate_values_to_mesh(
             grid_points,
             grid_values,
             mesh['vertices']
         )
-        
+
         if mesh_values is None:
             logging.error("Failed to interpolate values to mesh vertices")
             return None
-        
+
         # Step 6: Calculate element values from vertex values
         element_values = calculate_element_values(mesh, mesh_values)
-        
+
         # Step 7: Create final result dictionary
         result = {
             # Vertex values
@@ -4177,23 +5294,23 @@ def improved_hma(trabecular_image, mesh, grid_spacing=1.5, sphere_diameter=3.0, 
             'vertex_da': mesh_values['vertex_anisotropy'],
             'vertex_r_da': mesh_values['vertex_r_anisotropy'],
             'vertex_fabric': mesh_values['vertex_fabric'],
-            
+
             # Element values
             'element_bv_tv': element_values['element_bv_tv'],
             'element_r_bv_tv': element_values['element_r_bv_tv'],
             'element_da': element_values['element_anisotropy'],
             'element_r_da': element_values['element_r_anisotropy'],
             'element_fabric': element_values['element_fabric'],
-            
+
             # Mean values
             'mean_bv_tv': mesh_values['mean_bv_tv'],
             'mean_da': mesh_values['mean_anisotropy'],
-            
+
             # Confidence values
             'confidence': confidence_scores,
             'bone': bone_mask
         }
-        
+
         # Step 8: Visualize results if output directory is provided
         if output_dir:
             # Create debug visualizations
@@ -4207,19 +5324,20 @@ def improved_hma(trabecular_image, mesh, grid_spacing=1.5, sphere_diameter=3.0, 
                 bone_mask,
                 output_dir
             )
-        
+
         logging.info("Holistic morphometric analysis completed successfully.")
         return result
-        
+
     except Exception as e:
         logging.error(f"Error in holistic morphometric analysis: {e}")
         traceback.print_exc()
         return None
 
+
 def calculate_bvtv_and_anisotropy_at_grid_points(trabecular_image, grid_points, sphere_diameter=5.0):
     """
     Calculate BV/TV and anisotropy at each grid point according to Bachmann et al. 2022.
-    
+
     Parameters:
     -----------
     trabecular_image : sitk.Image
@@ -4228,7 +5346,7 @@ def calculate_bvtv_and_anisotropy_at_grid_points(trabecular_image, grid_points, 
         Array of physical coordinates for grid points
     sphere_diameter : float
         Diameter of sampling sphere in mm (default: 5.0 mm)
-        
+
     Returns:
     --------
     dict
@@ -4236,69 +5354,69 @@ def calculate_bvtv_and_anisotropy_at_grid_points(trabecular_image, grid_points, 
     """
     try:
         logging.info(f"Calculating BV/TV and anisotropy at {len(grid_points)} grid points...")
-        
+
         # Get image properties
         spacing = trabecular_image.GetSpacing()
         size = trabecular_image.GetSize()
         origin = trabecular_image.GetOrigin()
-        
+
         # Convert binary image to numpy array
         np_array = sitk.GetArrayFromImage(trabecular_image)
-        
+
         # Calculate sphere radius in voxels for each dimension
         radius_voxels = [sphere_diameter / (2.0 * spacing[i]) for i in range(3)]
-        
+
         # Initialize results
         bv_tv_values = np.zeros(len(grid_points))
         fabric_tensors = np.zeros((len(grid_points), 3, 3))
-        
+
         # Process in batches to save memory
         batch_size = 100
         total_batches = (len(grid_points) + batch_size - 1) // batch_size
-        
+
         for batch_idx in range(total_batches):
             start_idx = batch_idx * batch_size
             end_idx = min((batch_idx + 1) * batch_size, len(grid_points))
-            
+
             if batch_idx % 10 == 0:
-                logging.info(f"Processing grid batch {batch_idx+1}/{total_batches}")
-            
+                logging.info(f"Processing grid batch {batch_idx + 1}/{total_batches}")
+
             for i in range(start_idx, end_idx):
                 point = grid_points[i]
-                
+
                 # Convert physical point to voxel coordinates
                 idx_x = int((point[0] - origin[0]) / spacing[0])
                 idx_y = int((point[1] - origin[1]) / spacing[1])
                 idx_z = int((point[2] - origin[2]) / spacing[2])
-                
+
                 # Check if point is inside image domain
                 if (0 <= idx_x < size[0] and 0 <= idx_y < size[1] and 0 <= idx_z < size[2]):
                     # Define sampling sphere
                     x_min = max(0, int(idx_x - radius_voxels[0]))
-                    x_max = min(size[0]-1, int(idx_x + radius_voxels[0]))
+                    x_max = min(size[0] - 1, int(idx_x + radius_voxels[0]))
                     y_min = max(0, int(idx_y - radius_voxels[1]))
-                    y_max = min(size[1]-1, int(idx_y + radius_voxels[1]))
+                    y_max = min(size[1] - 1, int(idx_y + radius_voxels[1]))
                     z_min = max(0, int(idx_z - radius_voxels[2]))
-                    z_max = min(size[2]-1, int(idx_z + radius_voxels[2]))
-                    
+                    z_max = min(size[2] - 1, int(idx_z + radius_voxels[2]))
+
                     # Skip if sphere is too small or outside image
                     if x_min >= x_max or y_min >= y_max or z_min >= z_max:
                         continue
-                    
+
                     # Extract sphere region (numpy array is z,y,x)
-                    region = np_array[z_min:z_max+1, y_min:y_max+1, x_min:x_max+1]
-                    
+                    region = np_array[z_min:z_max + 1, y_min:y_max + 1, x_min:x_max + 1]
+
                     # Calculate BV/TV
                     total_voxels = region.size
                     bone_voxels = np.sum(region > 0)
-                    
+
                     if total_voxels > 0:
                         bv_tv = bone_voxels / total_voxels
                     else:
                         bv_tv = 0
-                        
+
                     bv_tv_values[i] = bv_tv
-                    
+
                     # Calculate fabric tensor using Mean Intercept Length (MIL) method
                     # as described in Bachmann et al. 2022 and Gross et al. 2014
                     if bone_voxels > 10 and region.shape[0] > 2 and region.shape[1] > 2 and region.shape[2] > 2:
@@ -4306,7 +5424,7 @@ def calculate_bvtv_and_anisotropy_at_grid_points(trabecular_image, grid_points, 
                             # Calculate structure tensor using gradient approach
                             # This is an approximation of the MIL
                             gz, gy, gx = np.gradient(region.astype(float))
-                            
+
                             # Create fabric tensor (structure tensor)
                             M = np.zeros((3, 3))
                             M[0, 0] = np.mean(gx * gx)  # xx
@@ -4315,13 +5433,13 @@ def calculate_bvtv_and_anisotropy_at_grid_points(trabecular_image, grid_points, 
                             M[1, 1] = np.mean(gy * gy)  # yy
                             M[1, 2] = M[2, 1] = np.mean(gy * gz)  # yz/zy
                             M[2, 2] = np.mean(gz * gz)  # zz
-                            
+
                             # Ensure matrix is positive definite
                             eigenvalues, eigenvectors = np.linalg.eigh(M)
                             if np.any(eigenvalues < 0):
                                 eigenvalues = np.abs(eigenvalues)
                                 M = eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
-                                
+
                             fabric_tensors[i] = M
                         except Exception as e:
                             logging.warning(f"Error calculating fabric tensor at point {i}: {e}")
@@ -4329,35 +5447,36 @@ def calculate_bvtv_and_anisotropy_at_grid_points(trabecular_image, grid_points, 
                     else:
                         # Not enough bone or region too small
                         fabric_tensors[i] = np.eye(3)  # Default to isotropic tensor
-        
+
         # Calculate degree of anisotropy from fabric tensors
         anisotropy_values = np.ones(len(grid_points))  # Default to isotropic
-        
+
         for i in range(len(grid_points)):
             try:
                 eigenvalues, _ = np.linalg.eigh(fabric_tensors[i])
                 eigenvalues = np.sort(eigenvalues)  # Sort in ascending order
-                
+
                 if eigenvalues[0] > 1e-6:  # Avoid division by zero
                     # DA = λ₁/λ₃ (largest divided by smallest eigenvalue)
                     anisotropy_values[i] = eigenvalues[2] / eigenvalues[0]
             except Exception as e:
                 logging.warning(f"Error calculating anisotropy at point {i}: {e}")
                 # Keep default value of 1.0 (isotropic)
-                
+
         # Calculate mean values (excluding zeros and outliers)
         valid_bv_tv = bv_tv_values[bv_tv_values > 0.01]
         mean_bv_tv = np.mean(valid_bv_tv) if len(valid_bv_tv) > 0 else 0.001
-        
+
         valid_anisotropy = anisotropy_values[(anisotropy_values > 1.0) & (anisotropy_values < 10.0)]
         mean_anisotropy = np.mean(valid_anisotropy) if len(valid_anisotropy) > 0 else 1.0
-        
+
         # Calculate relative values
         r_bv_tv_values = bv_tv_values / mean_bv_tv if mean_bv_tv > 0 else np.zeros_like(bv_tv_values)
-        r_anisotropy_values = anisotropy_values / mean_anisotropy if mean_anisotropy > 0 else np.ones_like(anisotropy_values)
-        
+        r_anisotropy_values = anisotropy_values / mean_anisotropy if mean_anisotropy > 0 else np.ones_like(
+            anisotropy_values)
+
         logging.info(f"BV/TV calculation completed. Mean BV/TV: {mean_bv_tv:.4f}, Mean DA: {mean_anisotropy:.4f}")
-        
+
         return {
             'grid_points': grid_points,
             'bv_tv': bv_tv_values,
@@ -4368,16 +5487,17 @@ def calculate_bvtv_and_anisotropy_at_grid_points(trabecular_image, grid_points, 
             'mean_bv_tv': mean_bv_tv,
             'mean_anisotropy': mean_anisotropy
         }
-        
+
     except Exception as e:
         logging.error(f"Error calculating BV/TV and anisotropy: {e}")
         traceback.print_exc()
         return None
 
+
 def create_confined_background_grid(trabecular_image, grid_spacing=2.5, margin_factor=1.1):
     """
     Create background grid confined to the bone region with margin.
-    
+
     Parameters:
     -----------
     trabecular_image : sitk.Image
@@ -4386,7 +5506,7 @@ def create_confined_background_grid(trabecular_image, grid_spacing=2.5, margin_f
         Grid spacing in mm (default: 2.5 mm)
     margin_factor : float
         Factor to add margin around bone (default: 1.2 = 20% extra space)
-        
+
     Returns:
     --------
     numpy.ndarray
@@ -4394,59 +5514,59 @@ def create_confined_background_grid(trabecular_image, grid_spacing=2.5, margin_f
     """
     try:
         logging.info("Creating confined background grid...")
-        
+
         # Get image properties
         spacing = trabecular_image.GetSpacing()
         size = trabecular_image.GetSize()
         origin = trabecular_image.GetOrigin()
-        
+
         # Convert binary image to numpy array
         array = sitk.GetArrayFromImage(trabecular_image)
-        
+
         # Extract bone content boundaries
         if np.sum(array) > 0:
             # Find indices of non-zero voxels
             indices = np.nonzero(array)
-            
+
             # Get min and max indices (z, y, x in numpy array)
             z_min, y_min, x_min = np.min(indices, axis=1)
             z_max, y_max, x_max = np.max(indices, axis=1)
-            
+
             # Convert to physical coordinates
             min_physical = [
                 origin[0] + x_min * spacing[0],
                 origin[1] + y_min * spacing[1],
                 origin[2] + z_min * spacing[2]
             ]
-            
+
             max_physical = [
                 origin[0] + x_max * spacing[0],
                 origin[1] + y_max * spacing[1],
                 origin[2] + z_max * spacing[2]
             ]
-            
+
             # Calculate center and dimensions
             center = [(min_physical[i] + max_physical[i]) / 2 for i in range(3)]
             dimensions = [max_physical[i] - min_physical[i] for i in range(3)]
-            
+
             # Add margin
             dimensions = [d * margin_factor for d in dimensions]
-            
+
             # Recalculate min and max with margin
-            min_physical = [center[i] - dimensions[i]/2 for i in range(3)]
-            max_physical = [center[i] + dimensions[i]/2 for i in range(3)]
-            
+            min_physical = [center[i] - dimensions[i] / 2 for i in range(3)]
+            max_physical = [center[i] + dimensions[i] / 2 for i in range(3)]
+
             # Create grid points
             grid_points = []
-            
+
             # Calculate number of points in each dimension
             n_points = [int(dimensions[i] / grid_spacing) + 1 for i in range(3)]
-            
+
             # Ensure at least 2 points in each dimension
             n_points = [max(2, n) for n in n_points]
-            
+
             logging.info(f"Creating grid with {n_points[0]}x{n_points[1]}x{n_points[2]} points")
-            
+
             # Create evenly spaced grid
             for k in range(n_points[2]):
                 z = min_physical[2] + k * (dimensions[2] / (n_points[2] - 1))
@@ -4455,7 +5575,7 @@ def create_confined_background_grid(trabecular_image, grid_spacing=2.5, margin_f
                     for i in range(n_points[0]):
                         x = min_physical[0] + i * (dimensions[0] / (n_points[0] - 1))
                         grid_points.append([x, y, z])
-            
+
             logging.info(f"Created background grid with {len(grid_points)} points")
             return np.array(grid_points)
         else:
@@ -4465,7 +5585,7 @@ def create_confined_background_grid(trabecular_image, grid_spacing=2.5, margin_f
             n_grid_x = max(2, int(physical_size[0] / grid_spacing) + 1)
             n_grid_y = max(2, int(physical_size[1] / grid_spacing) + 1)
             n_grid_z = max(2, int(physical_size[2] / grid_spacing) + 1)
-            
+
             grid_points = []
             for k in range(n_grid_z):
                 z = origin[2] + k * grid_spacing
@@ -4474,19 +5594,20 @@ def create_confined_background_grid(trabecular_image, grid_spacing=2.5, margin_f
                     for i in range(n_grid_x):
                         x = origin[0] + i * grid_spacing
                         grid_points.append([x, y, z])
-            
+
             logging.info(f"Created default grid with {len(grid_points)} points")
             return np.array(grid_points)
-            
+
     except Exception as e:
         logging.error(f"Error creating confined background grid: {e}")
         traceback.print_exc()
         return None
 
+
 def interpolate_values_to_mesh(grid_points, grid_values, mesh_vertices, k=8):
     """
     Interpolate values from grid points to mesh vertices.
-    
+
     Parameters:
     -----------
     grid_points : numpy.ndarray
@@ -4497,42 +5618,43 @@ def interpolate_values_to_mesh(grid_points, grid_values, mesh_vertices, k=8):
         Array of mesh vertex coordinates
     k : int
         Number of nearest neighbors for interpolation (default: 8)
-        
+
     Returns:
     --------
     dict
         Dictionary with interpolated values at mesh vertices
     """
     try:
-        logging.info(f"Interpolating values from {len(grid_points)} grid points to {len(mesh_vertices)} mesh vertices...")
-        
+        logging.info(
+            f"Interpolating values from {len(grid_points)} grid points to {len(mesh_vertices)} mesh vertices...")
+
         # Create KD-tree for efficient nearest neighbor search
         from scipy.spatial import cKDTree
         tree = cKDTree(grid_points)
-        
+
         # Initialize result arrays
         vertex_bv_tv = np.zeros(len(mesh_vertices))
         vertex_r_bv_tv = np.zeros(len(mesh_vertices))
         vertex_anisotropy = np.ones(len(mesh_vertices))
         vertex_r_anisotropy = np.ones(len(mesh_vertices))
         vertex_fabric = np.zeros((len(mesh_vertices), 3, 3))
-        
+
         # Process in batches to save memory
         batch_size = 10000
         total_batches = (len(mesh_vertices) + batch_size - 1) // batch_size
-        
+
         for batch_idx in range(total_batches):
             start_idx = batch_idx * batch_size
             end_idx = min((batch_idx + 1) * batch_size, len(mesh_vertices))
-            
+
             if batch_idx % 5 == 0:
-                logging.info(f"Processing vertex batch {batch_idx+1}/{total_batches}")
-            
+                logging.info(f"Processing vertex batch {batch_idx + 1}/{total_batches}")
+
             batch_vertices = mesh_vertices[start_idx:end_idx]
-            
+
             # Find k nearest neighbors for each vertex
             distances, indices = tree.query(batch_vertices, k=k)
-            
+
             # Handle case where some points might be far from any grid point
             valid_mask = distances < np.inf
             if not np.all(valid_mask):
@@ -4544,7 +5666,7 @@ def interpolate_values_to_mesh(grid_points, grid_values, mesh_vertices, k=8):
                         indices[i, 0] = idx
                         distances[i, 0] = 1.0
                         valid_mask[i, 0] = True
-            
+
             # Calculate interpolation weights using inverse distance weighting
             weights = np.zeros_like(distances)
             for i in range(len(batch_vertices)):
@@ -4553,26 +5675,26 @@ def interpolate_values_to_mesh(grid_points, grid_values, mesh_vertices, k=8):
                     # Inverse distance weights
                     inv_dist = 1.0 / (distances[i, valid_indices] + 1e-10)
                     weights[i, valid_indices] = inv_dist / np.sum(inv_dist)
-            
+
             # Interpolate BV/TV
             for i in range(end_idx - start_idx):
                 # BV/TV and relative BV/TV
                 vertex_bv_tv[start_idx + i] = np.sum(weights[i] * grid_values['bv_tv'][indices[i]])
                 vertex_r_bv_tv[start_idx + i] = np.sum(weights[i] * grid_values['r_bv_tv'][indices[i]])
-                
+
                 # Anisotropy and relative anisotropy
                 vertex_anisotropy[start_idx + i] = np.sum(weights[i] * grid_values['anisotropy'][indices[i]])
                 vertex_r_anisotropy[start_idx + i] = np.sum(weights[i] * grid_values['r_anisotropy'][indices[i]])
-                
+
                 # Fabric tensor (weighted average)
                 fabric = np.zeros((3, 3))
                 for j in range(k):
                     if weights[i, j] > 0:
                         fabric += weights[i, j] * grid_values['fabric_tensors'][indices[i, j]]
                 vertex_fabric[start_idx + i] = fabric
-        
+
         logging.info("Interpolation completed successfully.")
-        
+
         return {
             'vertex_bv_tv': vertex_bv_tv,
             'vertex_r_bv_tv': vertex_r_bv_tv,
@@ -4582,35 +5704,36 @@ def interpolate_values_to_mesh(grid_points, grid_values, mesh_vertices, k=8):
             'mean_bv_tv': grid_values['mean_bv_tv'],
             'mean_anisotropy': grid_values['mean_anisotropy']
         }
-        
+
     except Exception as e:
         logging.error(f"Error interpolating values to mesh: {e}")
         traceback.print_exc()
         return None
 
-def create_debug_visualizations(trabecular_image, mesh, grid_points, grid_values, mesh_values, 
-                              confidence_scores, bone_mask, output_dir):
+
+def create_debug_visualizations(trabecular_image, mesh, grid_points, grid_values, mesh_values,
+                                confidence_scores, bone_mask, output_dir):
     """
     Create debug visualizations for HMA with confidence scores.
     """
     try:
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d import Axes3D
-        
+
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
-        
+
         # Sample points for visualization (to avoid plotting all points)
         max_points = 2000
         if len(mesh['vertices']) > max_points:
             sample_indices = np.random.choice(len(mesh['vertices']), max_points, replace=False)
         else:
             sample_indices = np.arange(len(mesh['vertices']))
-        
+
         # 1. Confidence scores visualization
         fig = plt.figure(figsize=(15, 10))
         ax = fig.add_subplot(111, projection='3d')
-        
+
         scatter = ax.scatter(
             mesh['vertices'][sample_indices, 0],
             mesh['vertices'][sample_indices, 1],
@@ -4620,20 +5743,20 @@ def create_debug_visualizations(trabecular_image, mesh, grid_points, grid_values
             s=10,
             alpha=0.8
         )
-        
+
         plt.colorbar(scatter, ax=ax, label='Confidence Score')
         ax.set_title('Confidence Scores')
         ax.set_xlabel('X (mm)')
         ax.set_ylabel('Y (mm)')
         ax.set_zlabel('Z (mm)')
-        
+
         plt.savefig(os.path.join(output_dir, 'confidence_scores.png'), dpi=600)
         plt.close()
-        
+
         # 2. Bone mask visualization
         fig = plt.figure(figsize=(15, 10))
         ax = fig.add_subplot(111, projection='3d')
-        
+
         # Points with bone
         bone_indices = sample_indices[bone_mask[sample_indices]]
         if len(bone_indices) > 0:
@@ -4646,7 +5769,7 @@ def create_debug_visualizations(trabecular_image, mesh, grid_points, grid_values
                 alpha=0.8,
                 label='Bone Present'
             )
-        
+
         # Points without bone
         no_bone_indices = sample_indices[~bone_mask[sample_indices]]
         if len(no_bone_indices) > 0:
@@ -4659,24 +5782,24 @@ def create_debug_visualizations(trabecular_image, mesh, grid_points, grid_values
                 alpha=0.8,
                 label='No Bone'
             )
-        
+
         ax.set_title('Bone Presence Mask')
         ax.set_xlabel('X (mm)')
         ax.set_ylabel('Y (mm)')
         ax.set_zlabel('Z (mm)')
         ax.legend()
-        
+
         plt.savefig(os.path.join(output_dir, 'bone_mask.png'), dpi=600)
         plt.close()
-        
+
         # 3. Combined visualization
         fig = plt.figure(figsize=(15, 10))
         ax = fig.add_subplot(111, projection='3d')
-        
+
         # Color by confidence, but use different marker for bone presence
         bone_indices = sample_indices[bone_mask[sample_indices]]
         no_bone_indices = sample_indices[~bone_mask[sample_indices]]
-        
+
         if len(bone_indices) > 0:
             scatter1 = ax.scatter(
                 mesh['vertices'][bone_indices, 0],
@@ -4688,7 +5811,7 @@ def create_debug_visualizations(trabecular_image, mesh, grid_points, grid_values
                 marker='o',
                 alpha=0.8
             )
-        
+
         if len(no_bone_indices) > 0:
             scatter2 = ax.scatter(
                 mesh['vertices'][no_bone_indices, 0],
@@ -4700,26 +5823,27 @@ def create_debug_visualizations(trabecular_image, mesh, grid_points, grid_values
                 marker='x',
                 alpha=0.8
             )
-        
+
         plt.colorbar(scatter1, ax=ax, label='Confidence Score')
         ax.set_title('Confidence Scores with Bone Presence (o = bone, x = no bone)')
         ax.set_xlabel('X (mm)')
         ax.set_ylabel('Y (mm)')
         ax.set_zlabel('Z (mm)')
-        
+
         plt.savefig(os.path.join(output_dir, 'combined_visualization.png'), dpi=600)
         plt.close()
-        
+
         logging.info(f"Created confidence visualizations in {output_dir}")
-        
+
     except Exception as e:
         logging.error(f"Error creating debug visualizations: {e}")
         traceback.print_exc()
 
+
 def visualize_mesh_image_alignment(mesh, image, output_path):
     """
     Visualize alignment between mesh and image.
-    
+
     Parameters:
     -----------
     mesh : dict
@@ -4732,36 +5856,36 @@ def visualize_mesh_image_alignment(mesh, image, output_path):
     try:
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d import Axes3D
-        
+
         # Get image properties
         spacing = image.GetSpacing()
         size = image.GetSize()
         origin = image.GetOrigin()
-        
+
         # Convert binary image to numpy array
         array = sitk.GetArrayFromImage(image)
-        
+
         # Extract mesh boundaries
         vertices = mesh['vertices']
         mesh_min = np.min(vertices, axis=0)
         mesh_max = np.max(vertices, axis=0)
-        
+
         # Extract image boundaries
         if np.sum(array) > 0:
             # Find indices of non-zero voxels
             indices = np.nonzero(array)
-            
+
             # Get min and max indices (z, y, x in numpy array)
             z_min, y_min, x_min = np.min(indices, axis=1)
             z_max, y_max, x_max = np.max(indices, axis=1)
-            
+
             # Convert to physical coordinates
             image_min = [
                 origin[0] + x_min * spacing[0],
                 origin[1] + y_min * spacing[1],
                 origin[2] + z_min * spacing[2]
             ]
-            
+
             image_max = [
                 origin[0] + x_max * spacing[0],
                 origin[1] + y_max * spacing[1],
@@ -4771,18 +5895,18 @@ def visualize_mesh_image_alignment(mesh, image, output_path):
             # If image is empty, use full image domain
             image_min = [origin[i] for i in range(3)]
             image_max = [origin[i] + size[i] * spacing[i] for i in range(3)]
-        
+
         # Create figure with 4 subplots
         fig = plt.figure(figsize=(20, 15))
-        
+
         # 3D visualization of mesh and image
         ax1 = fig.add_subplot(221, projection='3d')
-        
+
         # Sample mesh vertices for visualization
         sample_size = min(1000, len(vertices))
         sample_indices = np.random.choice(len(vertices), sample_size, replace=False)
         sample_vertices = vertices[sample_indices]
-        
+
         # Plot mesh vertices
         ax1.scatter(
             sample_vertices[:, 0],
@@ -4792,23 +5916,23 @@ def visualize_mesh_image_alignment(mesh, image, output_path):
             alpha=0.5,
             label='Mesh Vertices'
         )
-        
+
         # Plot image boundaries as box
         def plot_box(ax, min_coords, max_coords, color='r', label=None):
             x_min, y_min, z_min = min_coords
             x_max, y_max, z_max = max_coords
-            
+
             # Create array of vertices
             xs = [x_min, x_max, x_max, x_min, x_min, x_max, x_max, x_min]
             ys = [y_min, y_min, y_max, y_max, y_min, y_min, y_max, y_max]
             zs = [z_min, z_min, z_min, z_min, z_max, z_max, z_max, z_max]
-            
+
             # List of sides' polygons
             verts = [
                 [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6],
                 [3, 0, 4, 7], [0, 1, 2, 3], [4, 5, 6, 7]
             ]
-            
+
             # Plot sides
             for v in verts:
                 ax.plot3D(
@@ -4818,101 +5942,102 @@ def visualize_mesh_image_alignment(mesh, image, output_path):
                     color=color,
                     alpha=0.7
                 )
-            
+
             # Add label to only one edge
             if label:
                 ax.plot3D([x_min, x_max], [y_min, y_min], [z_min, z_min], color=color, label=label)
-        
+
         # Plot image and mesh boundaries
         plot_box(ax1, image_min, image_max, color='r', label='Image Content')
         plot_box(ax1, mesh_min, mesh_max, color='g', label='Mesh Boundaries')
-        
+
         ax1.set_xlabel('X (mm)')
         ax1.set_ylabel('Y (mm)')
         ax1.set_zlabel('Z (mm)')
         ax1.set_title('3D Visualization of Mesh and Image Alignment')
         ax1.legend()
-        
+
         # Create 2D cross-sections
         # X-Y plane (mid Z)
         ax2 = fig.add_subplot(222)
         z_mid = int((z_min + z_max) / 2)
         if 0 <= z_mid < array.shape[0]:
             ax2.imshow(array[z_mid], cmap='gray', origin='lower')
-            
+
             # Project mesh vertices near z_mid to this slice
-            z_slice = sample_vertices[(sample_vertices[:, 2] >= origin[2] + (z_mid-1) * spacing[2]) & 
-                                     (sample_vertices[:, 2] <= origin[2] + (z_mid+1) * spacing[2])]
-            
+            z_slice = sample_vertices[(sample_vertices[:, 2] >= origin[2] + (z_mid - 1) * spacing[2]) &
+                                      (sample_vertices[:, 2] <= origin[2] + (z_mid + 1) * spacing[2])]
+
             if len(z_slice) > 0:
                 # Convert to pixel coordinates
                 px = (z_slice[:, 0] - origin[0]) / spacing[0]
                 py = (z_slice[:, 1] - origin[1]) / spacing[1]
-                
+
                 ax2.scatter(px, py, c='r', s=5, alpha=0.5)
-                
+
         ax2.set_title(f'X-Y Plane (Z={z_mid})')
-        
+
         # X-Z plane (mid Y)
         ax3 = fig.add_subplot(223)
         y_mid = int((y_min + y_max) / 2)
         if 0 <= y_mid < array.shape[1]:
             ax3.imshow(array[:, y_mid, :], cmap='gray', origin='lower')
-            
+
             # Project mesh vertices near y_mid to this slice
-            y_slice = sample_vertices[(sample_vertices[:, 1] >= origin[1] + (y_mid-1) * spacing[1]) & 
-                                     (sample_vertices[:, 1] <= origin[1] + (y_mid+1) * spacing[1])]
-            
+            y_slice = sample_vertices[(sample_vertices[:, 1] >= origin[1] + (y_mid - 1) * spacing[1]) &
+                                      (sample_vertices[:, 1] <= origin[1] + (y_mid + 1) * spacing[1])]
+
             if len(y_slice) > 0:
                 # Convert to pixel coordinates
                 px = (y_slice[:, 0] - origin[0]) / spacing[0]
                 pz = (y_slice[:, 2] - origin[2]) / spacing[2]
-                
+
                 ax3.scatter(px, pz, c='r', s=5, alpha=0.5)
-                
+
         ax3.set_title(f'X-Z Plane (Y={y_mid})')
-        
+
         # Y-Z plane (mid X)
         ax4 = fig.add_subplot(224)
         x_mid = int((x_min + x_max) / 2)
         if 0 <= x_mid < array.shape[2]:
             ax4.imshow(array[:, :, x_mid], cmap='gray', origin='lower')
-            
+
             # Project mesh vertices near x_mid to this slice
-            x_slice = sample_vertices[(sample_vertices[:, 0] >= origin[0] + (x_mid-1) * spacing[0]) & 
-                                     (sample_vertices[:, 0] <= origin[0] + (x_mid+1) * spacing[0])]
-            
+            x_slice = sample_vertices[(sample_vertices[:, 0] >= origin[0] + (x_mid - 1) * spacing[0]) &
+                                      (sample_vertices[:, 0] <= origin[0] + (x_mid + 1) * spacing[0])]
+
             if len(x_slice) > 0:
                 # Convert to pixel coordinates
                 py = (x_slice[:, 1] - origin[1]) / spacing[1]
                 pz = (x_slice[:, 2] - origin[2]) / spacing[2]
-                
+
                 ax4.scatter(py, pz, c='r', s=5, alpha=0.5)
-                
+
         ax4.set_title(f'Y-Z Plane (X={x_mid})')
-        
+
         # Adjust layout and save
         plt.tight_layout()
         plt.savefig(output_path, dpi=300)
         plt.close()
-        
+
         logging.info(f"Saved alignment visualization to {output_path}")
-        
+
     except Exception as e:
         logging.error(f"Error creating alignment visualization: {e}")
         traceback.print_exc()
 
+
 def calculate_element_values(mesh, vertex_values):
     """
     Calculate element values from vertex values.
-    
+
     Parameters:
     -----------
     mesh : dict
         Mesh dictionary with vertices and tetrahedra
     vertex_values : dict
         Dictionary with values at mesh vertices
-        
+
     Returns:
     --------
     dict
@@ -4920,30 +6045,30 @@ def calculate_element_values(mesh, vertex_values):
     """
     try:
         logging.info(f"Calculating element values for {len(mesh['tetrahedra'])} tetrahedra...")
-        
+
         # Initialize result arrays
         element_bv_tv = np.zeros(len(mesh['tetrahedra']))
         element_r_bv_tv = np.zeros(len(mesh['tetrahedra']))
         element_anisotropy = np.ones(len(mesh['tetrahedra']))
         element_r_anisotropy = np.ones(len(mesh['tetrahedra']))
         element_fabric = np.zeros((len(mesh['tetrahedra']), 3, 3))
-        
+
         # For each tetrahedron, average the values of its vertices
         for i, tet in enumerate(mesh['tetrahedra']):
             # BV/TV and relative BV/TV
             element_bv_tv[i] = np.mean(vertex_values['vertex_bv_tv'][tet])
             element_r_bv_tv[i] = np.mean(vertex_values['vertex_r_bv_tv'][tet])
-            
+
             # Anisotropy and relative anisotropy
             element_anisotropy[i] = np.mean(vertex_values['vertex_anisotropy'][tet])
             element_r_anisotropy[i] = np.mean(vertex_values['vertex_r_anisotropy'][tet])
-            
+
             # Fabric tensor (average of vertex tensors)
             fabric = np.zeros((3, 3))
             for v in tet:
                 fabric += vertex_values['vertex_fabric'][v]
             element_fabric[i] = fabric / len(tet)
-        
+
         return {
             'element_bv_tv': element_bv_tv,
             'element_r_bv_tv': element_r_bv_tv,
@@ -4951,16 +6076,17 @@ def calculate_element_values(mesh, vertex_values):
             'element_r_anisotropy': element_r_anisotropy,
             'element_fabric': element_fabric
         }
-        
+
     except Exception as e:
         logging.error(f"Error calculating element values: {e}")
         traceback.print_exc()
         return None
 
+
 def save_mesh_with_scalars_csv(mesh, scalars, base_filename):
     """
     Save mesh vertices and scalar values to CSV files for easier import into R.
-    
+
     Parameters:
     -----------
     mesh : dict
@@ -4973,19 +6099,19 @@ def save_mesh_with_scalars_csv(mesh, scalars, base_filename):
     try:
         # Save vertices
         vertices_file = f"{base_filename}_vertices.csv"
-        np.savetxt(vertices_file, mesh['vertices'], delimiter=',', 
-                  header='x,y,z', comments='')
-        
+        np.savetxt(vertices_file, mesh['vertices'], delimiter=',',
+                   header='x,y,z', comments='')
+
         # Save scalar values
         scalars_file = f"{base_filename}_scalars.csv"
         np.savetxt(scalars_file, scalars, delimiter=',',
-                  header='scalar_value', comments='')
-        
+                   header='scalar_value', comments='')
+
         # Save tetrahedra connectivity if needed
         tetras_file = f"{base_filename}_tetras.csv"
-        np.savetxt(tetras_file, mesh['tetrahedra'], delimiter=',', 
+        np.savetxt(tetras_file, mesh['tetrahedra'], delimiter=',',
                    fmt='%d', header='v1,v2,v3,v4', comments='')
-        
+
         logging.info(f"Saved CSV files for {base_filename}")
         return True
     except Exception as e:
@@ -4993,15 +6119,16 @@ def save_mesh_with_scalars_csv(mesh, scalars, base_filename):
         traceback.print_exc()
         return False
 
+
 def extract_principal_fabric_directions(fabric_tensor):
     """
     Extract principal directions (eigenvectors) and values (eigenvalues) from a fabric tensor.
-    
+
     Parameters:
     -----------
     fabric_tensor : numpy.ndarray
         3x3 fabric tensor
-        
+
     Returns:
     --------
     tuple
@@ -5009,43 +6136,44 @@ def extract_principal_fabric_directions(fabric_tensor):
     """
     try:
         eigenvalues, eigenvectors = np.linalg.eigh(fabric_tensor)
-        
+
         # Sort by decreasing eigenvalue
         idx = eigenvalues.argsort()[::-1]
         eigenvalues = eigenvalues[idx]
         eigenvectors = eigenvectors[:, idx]
-        
+
         return eigenvalues, eigenvectors
     except Exception as e:
         logging.error(f"Error extracting principal directions: {e}")
         return None, None
 
+
 def save_mean_fabric_tensors(results_dict, output_path):
     """
     Save the mean fabric tensors and their principal directions to a CSV file.
-    
+
     Parameters:
     -----------
     results_dict : dict
-        Dictionary containing condyle names and their corresponding fabric tensors
+        Dictionary containing bone names and their corresponding fabric tensors
     output_path : str
         Path to save the CSV file
     """
     try:
         # Prepare data structure for CSV
         csv_data = []
-        
-        for condyle_name, fabric_tensors in results_dict.items():
+
+        for bone_name, fabric_tensors in results_dict.items():
             # Calculate mean fabric tensor across all vertices
             mean_fabric = np.mean(fabric_tensors, axis=0)
-            
+
             # Extract principal directions and values
             eigenvalues, eigenvectors = extract_principal_fabric_directions(mean_fabric)
-            
+
             if eigenvalues is not None and eigenvectors is not None:
                 # Create row for CSV
                 row = {
-                    'condyle_name': condyle_name,
+                    'bone_name': bone_name,
                     # First principal direction (λ1, v1)
                     'lambda1': eigenvalues[0],
                     'v1_x': eigenvectors[0, 0],
@@ -5066,22 +6194,23 @@ def save_mean_fabric_tensors(results_dict, output_path):
                 }
                 csv_data.append(row)
             else:
-                logging.warning(f"Failed to extract principal directions for {condyle_name}")
-        
+                logging.warning(f"Failed to extract principal directions for {bone_name}")
+
         # Convert to DataFrame and save
         df = pd.DataFrame(csv_data)
         df.to_csv(output_path, index=False)
         logging.info(f"Saved mean fabric tensor principal directions to {output_path}")
-        
+
         return True
     except Exception as e:
         logging.error(f"Error saving mean fabric tensors: {e}")
         return False
 
-def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="reference", method="chma"):
+
+def isoHMA(input_dir, output_dir, iteration=2, cores='detect', reference="reference", method="chma"):
     """
     Execute Step B of the cHMA workflow: Create a canonical mesh and perform analyses.
-    
+
     Parameters:
     -----------
     input_dir : str
@@ -5116,35 +6245,35 @@ def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
     logging.info(f"Using {num_cores} CPU threads for SimpleITK processing")
 
     create_directories1(output_dir)
-    
+
     try:
-        #=======================================================================================
+        # =======================================================================================
         # B1. Load the canonical trabecular image
-        #=======================================================================================
+        # =======================================================================================
         logging.info("B1. Loading canonical trabecular image")
-        
-        trabecular_canonical_path = os.path.join(input_dir, "Canonical_Bone", "trabecular2.tiff")
+
+        trabecular_canonical_path = os.path.join(input_dir, "Canonical_Bone", "trabecular.tiff")
         canonical_path = os.path.join(input_dir, "Canonical_Bone", "canonical.tiff")
-        
+
         if not os.path.exists(trabecular_canonical_path):
             logging.error(f"Canonical trabecular image not found at {trabecular_canonical_path}")
             return False
-            
+
         if not os.path.exists(canonical_path):
             logging.error(f"Canonical bone image not found at {canonical_path}")
             return False
-            
+
         averaged_trabecular = load_image(trabecular_canonical_path)
         canonical_bone = load_image(canonical_path)
 
-        #=======================================================================================
+        # =======================================================================================
         # B2. Check for existing mesh or create tetrahedral mesh
-        #=======================================================================================
-        
+        # =======================================================================================
+
         logging.info("B2. Creating tetrahedral mesh of canonical trabecular image")
-        
+
         canonical_mesh = None
-        
+
         # Check for existing mesh files in different formats
         mesh_files = {
             'netgen': os.path.join(input_dir, "Canonical_Bone", "trabecular.vol"),
@@ -5153,7 +6282,7 @@ def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
             'tetgen_ele': os.path.join(input_dir, "Canonical_Bone", "trabecular.ele"),
             'vtk': os.path.join(input_dir, "Canonical_Bone", "trabecular.vtk")
         }
-        
+
         # Try loading from NetGen .vol file
         if os.path.exists(mesh_files['netgen']):
             canonical_mesh = load_netgen(mesh_files['netgen'])
@@ -5163,7 +6292,7 @@ def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
                 if canonical_tet_collapse < 0.9 or canonical_volume_skew > 0.75:
                     logging.warning("Loaded NetGen mesh quality is poor. Will try other formats.")
                     canonical_mesh = None
-        
+
         # Try loading from Gmsh .msh file
         if canonical_mesh is None and os.path.exists(mesh_files['gmsh']):
             canonical_mesh = load_gmsh_msh_mesh(mesh_files['gmsh'])
@@ -5173,9 +6302,10 @@ def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
                 if canonical_tet_collapse < 0.9 or canonical_volume_skew > 0.75:
                     logging.warning("Loaded Gmsh mesh quality is poor. Will try other formats.")
                     canonical_mesh = None
-        
+
         # Try loading from TetGen files
-        if canonical_mesh is None and os.path.exists(mesh_files['tetgen_node']) and os.path.exists(mesh_files['tetgen_ele']):
+        if canonical_mesh is None and os.path.exists(mesh_files['tetgen_node']) and os.path.exists(
+                mesh_files['tetgen_ele']):
             canonical_mesh = load_tetgen(mesh_files['tetgen_node'], mesh_files['tetgen_ele'])
             if canonical_mesh and len(canonical_mesh.get("tetrahedra", [])) > 0:
                 logging.info("Loaded mesh from TetGen files")
@@ -5183,7 +6313,7 @@ def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
                 if canonical_tet_collapse < 0.9 or canonical_volume_skew > 0.75:
                     logging.warning("Loaded TetGen mesh quality is poor. Will try other formats.")
                     canonical_mesh = None
-        
+
         # Try loading from VTK file
         if canonical_mesh is None and os.path.exists(mesh_files['vtk']):
             canonical_mesh = load_vtk(mesh_files['vtk'])
@@ -5193,11 +6323,11 @@ def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
                 if canonical_tet_collapse < 0.9 or canonical_volume_skew > 0.75:
                     logging.warning("Loaded VTK mesh quality is poor. Will try to create a new mesh.")
                     canonical_mesh = None
-        
+
         # If no valid mesh was loaded, create a new one
         if canonical_mesh is None or len(canonical_mesh.get("tetrahedra", [])) == 0:
             logging.info("Creating new solid tetrahedral mesh...")
-            
+
             # First try TetGen (most reliable)
             try:
                 canonical_mesh = create_solid_tetrahedral_mesh(
@@ -5211,7 +6341,7 @@ def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
             except Exception as e:
                 logging.warning(f"TetGen mesh creation failed: {e}")
                 canonical_mesh = None
-            
+
             # Try NetGen if TetGen failed
             if canonical_mesh is None:
                 try:
@@ -5226,7 +6356,7 @@ def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
                 except Exception as e:
                     logging.warning(f"NetGen mesh creation failed: {e}")
                     canonical_mesh = None
-            
+
             # Try GMsh if both failed
             if canonical_mesh is None:
                 try:
@@ -5241,98 +6371,101 @@ def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
                 except Exception as e:
                     logging.warning(f"GMsh mesh creation failed: {e}")
                     canonical_mesh = None
-        
+
         # If meshing failed
         if canonical_mesh is None or len(canonical_mesh.get("tetrahedra", [])) == 0:
             logging.error("All mesh creation methods failed. Cannot continue with analysis.")
             return False
-        
-        #===========================================================================================
+
+        # ===========================================================================================
         # B3. Evaluate mesh quality
-        #===========================================================================================
-        
+        # ===========================================================================================
+
         logging.info("B3. Evaluating final mesh quality.")
-        
+
         try:
             canonical_tet_collapse, canonical_volume_skew = evaluate_mesh_quality(canonical_mesh)
         except Exception as e:
             logging.error(f"Error evaluating mesh quality: {e}")
             canonical_tet_collapse, canonical_volume_skew = 0, 1  # Default values
             return False
-        logging.info(f"Canonical Mesh within acceptable tet collapse: {canonical_tet_collapse:.4f}, and volume skew: {canonical_volume_skew:.4f}. Proceeding.")
+        logging.info(
+            f"Canonical Mesh within acceptable tet collapse: {canonical_tet_collapse:.4f}, and volume skew: {canonical_volume_skew:.4f}. Proceeding.")
 
-        
-        #==========================================================================================
+        # ==========================================================================================
         # B4. Obtain and similarity register trabecular images for HMA
-        #==========================================================================================
+        # ==========================================================================================
 
         logging.info("B4. Obtaining trabecular images from directory")
-        
+
         trab_dir = os.path.join(input_dir, "Similarity_Transform", "Trabecular")
-        
+
         if not os.path.exists(trab_dir) or not os.listdir(trab_dir):
-            logging.warning("No trabecular images found. Registering original trabecular images to canonical bone for comparable HMA.")
+            logging.warning(
+                "No trabecular images found. Registering original trabecular images to canonical bone for comparable HMA.")
 
             os.makedirs(os.path.join(output_dir, "Similarity_Transform", "Trabecular"), exist_ok=True)
 
             tp = os.path.join(input_dir, "Trabecular")
             tf = [f for f in os.listdir(tp) if f.endswith(".tiff") or f.endswith(".tif")]
-            condyle_names = [f.replace("_trabecular_resampled.tiff", "").replace("_trabecular_resampled.tif", "") for f in tf]
-            
-            logging.info(f"Found {len(condyle_names)} condyles")
+            bone_names = [f.replace("_trabecular_resampled.tiff", "").replace("_trabecular_resampled.tif", "") for f
+                             in tf]
+
+            logging.info(f"Found {len(bone_names)} Bones")
 
             ref_path = os.path.join(input_dir, "Similarity_Transform", "Filled", f"{reference}.tiff")
-            reference_condyle = load_image(ref_path)
-            
-            for condyle in condyle_names:
+            reference_bone = load_image(ref_path)
+
+            for bone in bone_names:
                 try:
-                    logging.info(f"Processing {condyle}...")
-                    
+                    logging.info(f"Processing {bone}...")
+
                     # Find trabecular image
-                    trab_path = os.path.join(tp, f"{condyle}_trabecular_resampled.tiff")
+                    trab_path = os.path.join(tp, f"{bone}_trabecular_resampled.tiff")
                     if not os.path.exists(trab_path):
-                        trab_path = os.path.join(tp, f"{condyle}_trabecular_resampled.tif")
+                        trab_path = os.path.join(tp, f"{bone}_trabecular_resampled.tif")
                         if not os.path.exists(trab_path):
-                            logging.warning(f"No trabecular image found for {condyle}. Skipping.")
+                            logging.warning(f"No trabecular image found for {bone}. Skipping.")
                             continue
                     trab_image = load_image(trab_path)
-    
+
                     # Find transform files
-                    sim_tfm_path = os.path.join(input_dir, "Similarity_Transform", "Transforms", f"{condyle}.tfm")
-                    sim_iter_tfm_path = os.path.join(input_dir, "Similarity_Transform", "Transforms2", f"{condyle}_iter{iteration}.tfm")
-                    
+                    sim_tfm_path = os.path.join(input_dir, "Similarity_Transform", "Transforms", f"{bone}.tfm")
+                    sim_iter_tfm_path = os.path.join(input_dir, "Similarity_Transform", "Transforms2",
+                                                     f"{bone}_iter{iteration}.tfm")
+
                     # Load transforms
                     sim_tfm = sitk.ReadTransform(sim_tfm_path)
                     sim_iter_tfm = sitk.ReadTransform(sim_iter_tfm_path)
-    
+
                     # Apply Transforms
-                    sim_1 = apply_transform(trab_image, sim_tfm, reference_condyle)
+                    sim_1 = apply_transform(trab_image, sim_tfm, reference_bone)
                     sim_2 = apply_transform(sim_1, sim_iter_tfm, canonical_bone)
-    
+
                     # Save trabecular image
-                    stpath = os.path.join(trab_dir, f"{condyle}.tiff")
+                    stpath = os.path.join(trab_dir, f"{bone}.tiff")
                     sitk.WriteImage(sim_2, stpath)
-    
+
                 except Exception as e:
-                    logging.error(f"Error processing {condyle}: {e}")
+                    logging.error(f"Error processing {bone}: {e}")
                     traceback.print_exc()
-                    continue   
-            logging.info("Successfully ensured the compatability of each trabecular image associated with each condyle. Proceeding.")
+                    continue
+            logging.info(
+                "Successfully ensured the compatability of each trabecular image associated with each bone. Proceeding.")
         else:
             trab_files = [f for f in os.listdir(trab_dir) if f.endswith(".tiff") or f.endswith(".tif")]
-            condyle_names = [f.replace(".tiff", "").replace(".tif", "") for f in trab_files]
-            logging.info(f"Found {len(condyle_names)} condyles")
+            bone_names = [f.replace(".tiff", "").replace(".tif", "") for f in trab_files]
+            logging.info(f"Found {len(bone_names)} Bones")
 
+        # =======================================================================================
+        # B5. Create isotopological meshes and perform HMA for each bone
+        # =======================================================================================
 
-        #=======================================================================================
-        # B5. Create isotopological meshes and perform HMA for each condyle
-        #=======================================================================================
-        
-        logging.info("B5. Creating isotopological meshes and performing HMA for each condyle")
-        
+        logging.info("B5. Creating isotopological meshes and performing HMA for each bone")
+
         # Initialize results dictionary
         results = {
-            'condyle_name': [],
+            'bone_name': [],
             'tet_collapse': [],
             'volume_skew': [],
             'mean_bv_tv': [],
@@ -5340,42 +6473,42 @@ def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
         }
 
         fabric_tensors = {}
-        
-        for condyle in condyle_names:
+
+        for bone in bone_names:
             try:
-                logging.info(f"Processing {condyle}...")
+                logging.info(f"Processing {bone}...")
 
                 if method == "chma":
-                              
+
                     # Find trabecular image
-                    trab_path = os.path.join(trab_dir, f"{condyle}.tiff")
+                    trab_path = os.path.join(trab_dir, f"{bone}.tiff")
                     if not os.path.exists(trab_path):
-                        trab_path = os.path.join(trab_dir, f"{condyle}.tif")
+                        trab_path = os.path.join(trab_dir, f"{bone}.tif")
                         if not os.path.exists(trab_path):
-                            logging.warning(f"No trabecular image found for {condyle}. Skipping.")
+                            logging.warning(f"No trabecular image found for {bone}. Skipping.")
                             continue
-                    
+
                     # Load trabecular image
                     trab_image = load_image(trab_path)
-                    
+
                     # Morph canonical mesh to individual trabecular space
                     morphed_mesh = isomorph(
                         canonical_mesh,
                         averaged_trabecular,
                         trab_image,
                         input_dir,
-                        condyle,
+                        bone,
                         iteration,
                         debug_dir=os.path.join(output_dir, "Debug")
                     )
-                    
+
                 else:
                     # Find trabecular image
-                    trab_path = os.path.join(input_dir, "BSpline_Transform", "Trabecular", f"{condyle}.tiff")
+                    trab_path = os.path.join(input_dir, "BSpline_Transform", "Trabecular", f"{bone}.tiff")
                     if not os.path.exists(trab_path):
-                        trab_path = os.path.join(input_dir, "BSpline_Transform", "Trabecular", f"{condyle}.tif")
+                        trab_path = os.path.join(input_dir, "BSpline_Transform", "Trabecular", f"{bone}.tif")
                         if not os.path.exists(trab_path):
-                            logging.warning(f"No trabecular image found for {condyle}. Skipping.")
+                            logging.warning(f"No trabecular image found for {bone}. Skipping.")
                             continue
 
                     trab_image = load_image(trab_path)
@@ -5384,70 +6517,70 @@ def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
                         morphed_mesh,
                         trab_image
                     )
-                    
+
                 if morphed_mesh is None:
-                    logging.warning(f"Failed to morph mesh for {condyle}. Skipping.")
+                    logging.warning(f"Failed to morph mesh for {bone}. Skipping.")
                     continue
-                
+
                 # Save morphed mesh
-                morphed_mesh_path = os.path.join(output_dir, "Isotopological_Meshes", f"{condyle}_mesh.vtk")
+                morphed_mesh_path = os.path.join(output_dir, "Isotopological_Meshes", f"{bone}_mesh.vtk")
                 save_mesh_as_vtk(morphed_mesh, morphed_mesh_path)
-                
+
                 # Perform HMA analysis
                 hma_results = improved_hma(
                     trab_image,
                     morphed_mesh,
                     grid_spacing=1.5,
                     sphere_diameter=3.0,
-                    output_dir=os.path.join(output_dir, "HMA_Results", condyle)
+                    output_dir=os.path.join(output_dir, "HMA_Results", bone)
                 )
-                
+
                 if hma_results is None:
-                    logging.warning(f"HMA analysis failed for {condyle}")
+                    logging.warning(f"HMA analysis failed for {bone}")
                     continue
-                
+
                 # Save HMA results including confidence and bone mask
-                rbvtv_path = os.path.join(output_dir, "HMA_Results", f"{condyle}_rbvtv.vtu")
-                rda_path = os.path.join(output_dir, "HMA_Results", f"{condyle}_rda.vtu")
-                #confidence_path = os.path.join(output_dir, "HMA_Results", f"{condyle}_confidence.vtu")
-                #bone_path = os.path.join(output_dir, "HMA_Results", f"{condyle}_bone.vtu")
-                
+                rbvtv_path = os.path.join(output_dir, "HMA_Results", f"{bone}_rbvtv.vtu")
+                rda_path = os.path.join(output_dir, "HMA_Results", f"{bone}_rda.vtu")
+                # confidence_path = os.path.join(output_dir, "HMA_Results", f"{bone}_confidence.vtu")
+                # bone_path = os.path.join(output_dir, "HMA_Results", f"{bone}_bone.vtu")
+
                 save_mesh_with_scalars(morphed_mesh, hma_results['vertex_r_bv_tv'], rbvtv_path)
                 save_mesh_with_scalars(morphed_mesh, hma_results['vertex_r_da'], rda_path)
-                #save_mesh_with_scalars(morphed_mesh, hma_results['confidence'], confidence_path)
-                #save_mesh_with_scalars(morphed_mesh, hma_results['bone'].astype(float), bone_path)
-                
+                # save_mesh_with_scalars(morphed_mesh, hma_results['confidence'], confidence_path)
+                # save_mesh_with_scalars(morphed_mesh, hma_results['bone'].astype(float), bone_path)
+
                 # Save CSV files for R
-                csv_base_path = os.path.join(output_dir, "HMA_Results", f"{condyle}_rbvtv")
+                csv_base_path = os.path.join(output_dir, "HMA_Results", f"{bone}_rbvtv")
                 save_mesh_with_scalars_csv(morphed_mesh, hma_results['vertex_r_bv_tv'], csv_base_path)
-                
-                csv_base_path = os.path.join(output_dir, "HMA_Results", f"{condyle}_rda")
+
+                csv_base_path = os.path.join(output_dir, "HMA_Results", f"{bone}_rda")
                 save_mesh_with_scalars_csv(morphed_mesh, hma_results['vertex_r_da'], csv_base_path)
-                
-                csv_base_path = os.path.join(output_dir, "HMA_Results", f"{condyle}_confidence")
+
+                csv_base_path = os.path.join(output_dir, "HMA_Results", f"{bone}_confidence")
                 save_mesh_with_scalars_csv(morphed_mesh, hma_results['confidence'], csv_base_path)
-                
-                csv_base_path = os.path.join(output_dir, "HMA_Results", f"{condyle}_bone")
+
+                csv_base_path = os.path.join(output_dir, "HMA_Results", f"{bone}_bone")
                 save_mesh_with_scalars_csv(morphed_mesh, hma_results['bone'].astype(float), csv_base_path)
-                
+
                 # Evaluate mesh quality
                 tet_collapse, volume_skew = evaluate_mesh_quality(morphed_mesh)
-                
+
                 # Add to results
-                results['condyle_name'].append(condyle)
+                results['bone_name'].append(bone)
                 results['tet_collapse'].append(tet_collapse)
                 results['volume_skew'].append(volume_skew)
                 results['mean_bv_tv'].append(hma_results['mean_bv_tv'])
                 results['mean_da'].append(hma_results['mean_da'])
-                fabric_tensors[condyle] = hma_results['vertex_fabric']
-                
-                logging.info(f"Completed processing {condyle}")
-                
+                fabric_tensors[bone] = hma_results['vertex_fabric']
+
+                logging.info(f"Completed processing {bone}")
+
             except Exception as e:
-                logging.error(f"Error processing {condyle}: {e}")
+                logging.error(f"Error processing {bone}: {e}")
                 traceback.print_exc()
                 continue
-                
+
         # Save results to CSV
         fabric_tensors_path = os.path.join(output_dir, "Bone_Orientation.csv")
         save_mean_fabric_tensors(fabric_tensors, fabric_tensors_path)
@@ -5458,11 +6591,11 @@ def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
         # Calculate total runtime
         end_time = time.time()
         total_time = end_time - start_time
-        logging.info(f"cHMA analysis completed in {total_time/60:.2f} minutes")
+        logging.info(f"cHMA analysis completed in {total_time / 60:.2f} minutes")
         gc.collect()
-        
+
         return True
-        
+
     except Exception as e:
         logging.error(f"Error in isoHMA: {e}")
         traceback.print_exc()
@@ -5476,11 +6609,11 @@ def isoHMA(input_dir, output_dir, iteration=2, cores = 'detect', reference="refe
 def smesh(input_file, pc_loadings, output_file, pc_name="PC1"):
     """
     Add scalar PC loadings to an existing mesh file (.vtk, .vol, or other formats).
-    
+
     This function supports the cHMA methodology described in Bachmann et al. 2022
     for trabecular bone analysis by adding principal component loadings as scalar
     values to mesh vertices.
-    
+
     Parameters:
     -----------
     input_file : str
@@ -5491,7 +6624,7 @@ def smesh(input_file, pc_loadings, output_file, pc_name="PC1"):
         Path to output VTK file
     pc_name : str
         Name of the PC component (default: "PC1")
-        
+
     Returns:
     --------
     str
@@ -5501,12 +6634,12 @@ def smesh(input_file, pc_loadings, output_file, pc_name="PC1"):
     import vtk
     from vtk.util import numpy_support
     import os
-    
+
     print(f"Reading input mesh file: {input_file}")
-    
+
     # Check file extension to determine the correct reader
     file_ext = os.path.splitext(input_file)[1].lower()
-    
+
     if file_ext == '.vtk':
         # For VTK files
         reader = vtk.vtkUnstructuredGridReader()
@@ -5517,41 +6650,41 @@ def smesh(input_file, pc_loadings, output_file, pc_name="PC1"):
         # For NetGen .vol files
         with open(input_file, 'r') as f:
             lines = f.readlines()
-        
+
         # Find points section
         try:
             points_idx = lines.index("points\n")
             num_points = int(lines[points_idx + 1])
-            
+
             # Read vertices
             vertices = np.zeros((num_points, 3))
             for i in range(num_points):
                 line = lines[points_idx + 2 + i].strip()
                 coords = np.array([float(x) for x in line.split()])
                 vertices[i] = coords[:3]
-            
+
             # Find volumeelements section
             vol_idx = lines.index("volumeelements\n")
             num_elements = int(lines[vol_idx + 1])
-            
+
             # Read tetrahedra
             tetrahedra = np.zeros((num_elements, 4), dtype=np.int32)
             for i in range(num_elements):
                 line = lines[vol_idx + 2 + i].strip()
                 parts = np.array([int(x) for x in line.split()])
-                
+
                 if len(parts) >= 8:
                     # Format: type mat domain vol v1 v2 v3 v4
                     tetrahedra[i] = parts[4:8] - 1  # Convert to 0-based indexing
                 elif len(parts) >= 5:
                     # Alternative format
                     tetrahedra[i] = parts[-4:] - 1  # Convert to 0-based indexing
-            
+
             # Create VTK points
             points = vtk.vtkPoints()
             for i in range(len(vertices)):
                 points.InsertNextPoint(vertices[i])
-            
+
             # Create VTK cells
             cells = vtk.vtkCellArray()
             for i in range(len(tetrahedra)):
@@ -5559,7 +6692,7 @@ def smesh(input_file, pc_loadings, output_file, pc_name="PC1"):
                 for j in range(4):
                     tetra.GetPointIds().SetId(j, int(tetrahedra[i, j]))
                 cells.InsertNextCell(tetra)
-            
+
             # Create unstructured grid
             grid = vtk.vtkUnstructuredGrid()
             grid.SetPoints(points)
@@ -5574,21 +6707,21 @@ def smesh(input_file, pc_loadings, output_file, pc_name="PC1"):
             reader.SetFileName(input_file)
             reader.Update()
             grid = reader.GetOutput()
-            
+
             if not grid or grid.GetNumberOfPoints() == 0:
                 # Try unstructured grid reader
                 reader = vtk.vtkUnstructuredGridReader()
                 reader.SetFileName(input_file)
                 reader.Update()
                 grid = reader.GetOutput()
-                
+
             if not grid or grid.GetNumberOfPoints() == 0:
                 # Try polydata reader
                 reader = vtk.vtkPolyDataReader()
                 reader.SetFileName(input_file)
                 reader.Update()
                 grid = reader.GetOutput()
-                
+
                 # Convert polydata to unstructured grid if needed
                 if grid and grid.GetNumberOfPoints() > 0:
                     ug = vtk.vtkUnstructuredGrid()
@@ -5598,21 +6731,21 @@ def smesh(input_file, pc_loadings, output_file, pc_name="PC1"):
         except Exception as e:
             print(f"Error reading file with generic reader: {e}")
             return None
-    
+
     # Check if the grid was successfully loaded
     if not grid or grid.GetNumberOfPoints() == 0:
         print("Failed to read mesh file or mesh file is empty")
         return None
-    
+
     # Get number of vertices
     num_vertices = grid.GetNumberOfPoints()
     print(f"Mesh has {num_vertices} points and {grid.GetNumberOfCells()} cells")
-    
+
     # Check dimensions
     if len(pc_loadings) != num_vertices:
         print(f"Warning: Number of PC loadings ({len(pc_loadings)}) doesn't match number of vertices ({num_vertices})")
         print("Attempting to adjust PC loadings...")
-        
+
         if len(pc_loadings) > num_vertices:
             # Truncate PC loadings
             pc_loadings = pc_loadings[:num_vertices]
@@ -5621,7 +6754,7 @@ def smesh(input_file, pc_loadings, output_file, pc_name="PC1"):
             # Pad PC loadings with zeros
             pc_loadings = np.pad(pc_loadings, (0, num_vertices - len(pc_loadings)), 'constant')
             print(f"Padded PC loadings to {len(pc_loadings)} entries")
-    
+
     # Add PC loadings as point data
     loadings_array = numpy_support.numpy_to_vtk(
         num_array=pc_loadings,
@@ -5631,14 +6764,142 @@ def smesh(input_file, pc_loadings, output_file, pc_name="PC1"):
     loadings_array.SetName(pc_name)
     grid.GetPointData().AddArray(loadings_array)
     grid.GetPointData().SetActiveScalars(pc_name)
-    
+
     # Write VTK file
     print(f"Writing VTK file: {output_file}")
     writer = vtk.vtkUnstructuredGridWriter()
     writer.SetFileName(output_file)
     writer.SetInputData(grid)
     writer.Write()
-    
+
     print("VTK file created successfully")
     return output_file
 
+def MCA_Annotate(data_dir, muscle_files_dict):
+    """
+    :param data_dir: The input directory where the muscle annotations and 2D matrix of vertex and scalars are stored.
+    :param muscle_files_dict: List object displaying the file names of the muscle annotations with the preferred name.
+    :return: A File called Annotate.csv in the specified data_dir directory
+    """
+    print(f"Scanning directory: {data_dir}\n")
+
+    # Load the main scalar files
+    rbv_path = os.path.join(data_dir, "RBVSC.csv")
+    rda_path = os.path.join(data_dir, "RDASC.csv")
+
+    if not os.path.exists(rbv_path) or not os.path.exists(rda_path):
+        print("Error: Could not find RBVSC.csv or RDASC.csv.")
+        return
+
+    print("Loading massive scalar CSVs... (This will take a few seconds)")
+    rbv_df = pd.read_csv(rbv_path)
+    rda_df = pd.read_csv(rda_path)
+
+    # Safely set the index to the "ID" column (BU 18, Kebara2, etc.)
+    if 'ID' in rbv_df.columns:
+        rbv_df.set_index('ID', inplace=True)
+    elif not isinstance(rbv_df.index[0], str):
+        # Fallback if the column isn't explicitly named 'ID' but is the second column
+        rbv_df.set_index(rbv_df.columns[1], inplace=True)
+
+    if 'ID' in rda_df.columns:
+        rda_df.set_index('ID', inplace=True)
+    elif not isinstance(rda_df.index[0], str):
+        rda_df.set_index(rda_df.columns[1], inplace=True)
+
+    # Convert columns to a fast-lookup Set
+    rbv_cols_set = set(rbv_df.columns)
+    rda_cols_set = set(rda_df.columns)
+
+    all_results = []
+
+    for file_name, muscle_name in muscle_files_dict.items():
+        muscle_path = os.path.join(data_dir, file_name)
+
+        if not os.path.exists(muscle_path):
+            print(f"Skipping {muscle_name}: Not found.")
+            continue
+
+        muscle_df = pd.read_csv(muscle_path)
+
+        if 'vtkOriginalPointIds' in muscle_df.columns:
+            raw_ids = muscle_df['vtkOriginalPointIds'].astype(float).astype(int).tolist()
+        else:
+            print(f"Warning: No valid Point ID column found in {file_name}.")
+            continue
+
+        # ---------------------------------------------------------
+        # THE CUSTOM MAPPING ENGINE ('scalar_X' + 1)
+        # ---------------------------------------------------------
+        valid_cols_rbv = []
+        valid_cols_rda = []
+
+        for pid in raw_ids:
+            # Shift the index by +1 to account for ParaView vs R counting
+            shifted_id = pid + 1
+            target_col = f"scalar_{shifted_id}"
+
+            # Fallback just in case they actually match perfectly
+            exact_col = f"scalar_{pid}"
+
+            if target_col in rbv_cols_set:
+                valid_cols_rbv.append(target_col)
+            elif exact_col in rbv_cols_set:
+                valid_cols_rbv.append(exact_col)
+
+        for pid in raw_ids:
+            shifted_id = pid + 1
+            target_col = f"scalar_{shifted_id}"
+            exact_col = f"scalar_{pid}"
+
+            if target_col in rda_cols_set:
+                valid_cols_rda.append(target_col)
+            elif exact_col in rda_cols_set:
+                valid_cols_rda.append(exact_col)
+
+        print(f"Processing {muscle_name}: Matched {len(valid_cols_rbv)} / {len(raw_ids)} vertices.")
+
+        if len(valid_cols_rbv) == 0:
+            print(f"  -> ERROR: Could not find matching columns for {muscle_name}.")
+            continue
+
+        # Calculate Means
+        rbv_means = rbv_df[valid_cols_rbv].mean(axis=1)
+        rda_means = rda_df[valid_cols_rda].mean(axis=1)
+
+        temp_df = pd.DataFrame({
+            'ID': rbv_means.index,
+            'Muscle_Region': muscle_name,
+            'RBV_Mean': rbv_means.values,
+            'RDA_Mean': rda_means.values
+        })
+
+        # Categorize
+        labels = ['Very Low', 'Low', 'Medium', 'High', 'Very High']
+        try:
+            temp_df['RBV_Intensity'] = pd.qcut(temp_df['RBV_Mean'].dropna(), q=5, labels=labels)
+            temp_df['RDA_Intensity'] = pd.qcut(temp_df['RDA_Mean'].dropna(), q=5, labels=labels)
+        except ValueError:
+            temp_df['RBV_Intensity'] = "N/A"
+            temp_df['RDA_Intensity'] = "N/A"
+
+        all_results.append(temp_df)
+
+    if not all_results:
+        print("\nNo valid data to combine.")
+        return
+
+    long_df = pd.concat(all_results, ignore_index=True)
+    wide_df = long_df.pivot(index='ID', columns='Muscle_Region',
+                            values=['RBV_Intensity', 'RDA_Intensity', 'RBV_Mean', 'RDA_Mean'])
+    wide_df.columns = [f"{muscle}_{metric}" for metric, muscle in wide_df.columns]
+    wide_df.reset_index(inplace=True)
+
+    # Make sure we didn't accidentally keep the 'Unnamed: 0' column as a specimen ID
+    if 'Unnamed: 0' in wide_df.columns:
+        wide_df.drop(columns=['Unnamed: 0'], inplace=True)
+
+    output_path = os.path.join(data_dir, "Categorized_Muscle_Intensities_Wide.csv")
+    wide_df.to_csv(output_path, index=False)
+
+    print(f"\nSuccess! MCA Table saved to:\n{output_path}")
