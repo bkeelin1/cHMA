@@ -1,6 +1,5 @@
 # Canonical Holistic Morphometric Analysis (cHMA)
 # Author: Brian Anthony Keeling
-# Modified: File naming convention updated to use ID.tiff instead of ID_type_resampled.tiff
 
 import os
 import numpy as np
@@ -29,6 +28,381 @@ from scipy.ndimage import binary_closing, binary_opening, binary_dilation, binar
 from scipy.spatial import Delaunay, cKDTree
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+
+def generate_robust_outer_hull(bone_mask):
+    """
+    Uses orthogonal 2D slice-by-slice hole filling to perfectly seal
+    open-ended bones (like condyle necks) without losing 3D concavities.
+    """
+    arr = sitk.GetArrayFromImage(bone_mask).astype(bool)
+
+    # 1. Fill holes slice-by-slice along Z
+    fill_z = np.zeros_like(arr)
+    for z in range(arr.shape[0]):
+        fill_z[z, :, :] = ndimage.binary_fill_holes(arr[z, :, :])
+
+    # 2. Fill holes slice-by-slice along Y
+    fill_y = np.zeros_like(arr)
+    for y in range(arr.shape[1]):
+        fill_y[:, y, :] = ndimage.binary_fill_holes(arr[:, y, :])
+
+    # 3. Fill holes slice-by-slice along X
+    fill_x = np.zeros_like(arr)
+    for x in range(arr.shape[2]):
+        fill_x[:, :, x] = ndimage.binary_fill_holes(arr[:, :, x])
+
+    # The true solid hull is the intersection of all three orthogonal fills
+    hull_arr = fill_z & fill_y & fill_x
+
+    hull_img = sitk.GetImageFromArray(hull_arr.astype(np.uint8))
+    hull_img.CopyInformation(bone_mask)
+    return hull_img
+
+
+def slicer_surface_wrap_solidify(bone_mask, wrap_radius=6):
+    """
+    A pure Python implementation of 3D Slicer's 'Surface Wrap Solidify' extension.
+    It seals open cut planes (like a condyle neck) and micro-cracks by expanding,
+    isolating the scanner background, inverting, and shrinking back.
+    """
+    #logging.info(f"  -> Slicer Wrap: Dilating by {wrap_radius} to seal surface leaks...")
+    dilated_bone = sitk.BinaryDilate(bone_mask, [wrap_radius, wrap_radius, wrap_radius], sitk.sitkBall)
+
+    #logging.info("  -> Slicer Wrap: Isolating the scanner background...")
+    # Everything that is 0 is air (both inside and outside)
+    air_mask = dilated_bone == 0
+    cc_air = sitk.ConnectedComponent(air_mask)
+    stats_air = sitk.LabelShapeStatisticsImageFilter()
+    stats_air.Execute(cc_air)
+
+    # The largest pocket of air is the infinite scanner background
+    largest_air_label = max(stats_air.GetLabels(), key=lambda l: stats_air.GetPhysicalSize(l))
+    outside_air = sitk.BinaryThreshold(
+        cc_air, lowerThreshold=largest_air_label,
+        upperThreshold=largest_air_label, insideValue=1, outsideValue=0
+    )
+
+    #logging.info("  -> Slicer Wrap: Inverting background and eroding back to anatomical boundary...")
+    # Everything NOT outside air is the solid condyle
+    solid_dilated = outside_air == 0
+
+    # Shrink it back to exactly fit the original bone
+    solid_condyle = sitk.BinaryErode(solid_dilated, [wrap_radius, wrap_radius, wrap_radius], sitk.sitkBall)
+    return solid_condyle
+
+
+def Segment(input_dir, output_dir):
+    """Automated pipeline strictly following the 10-Step Slicer Workflow."""
+
+    log_file = os.path.join(output_dir, f"Segmentation_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+                        handlers=[logging.FileHandler(log_file), logging.StreamHandler()])
+
+    logging.info(f"Starting 10-Step Segmentation pipeline. Input: {input_dir} | Output: {output_dir}")
+
+    dirs = {
+        'Raw': os.path.join(output_dir, 'Raw'),
+        'Filled': os.path.join(output_dir, 'Filled'),
+        'Cortical': os.path.join(output_dir, 'Cortical'),
+        'Trabecular': os.path.join(output_dir, 'Trabecular'),
+        'Debug': os.path.join(output_dir, 'Debug')
+    }
+    for d in dirs.values():
+        os.makedirs(d, exist_ok=True)
+
+    valid_extensions = ('.tiff', '.tif')
+    files = [f for f in os.listdir(input_dir) if f.lower().endswith(valid_extensions)]
+
+    if not files:
+        logging.error(f"No files found in {input_dir}.")
+        return False
+
+    for filename in files:
+        bone_id = os.path.splitext(filename)[0]
+        input_path = os.path.join(input_dir, filename)
+
+        try:
+            logging.info(f"--- Processing {bone_id} ---")
+            raw_image = load_image(input_path)
+            sitk.WriteImage(raw_image, os.path.join(dirs['Raw'], f"{bone_id}.tiff"))
+
+            # --- STEP 1: THRESHOLD THE BONE ---
+            np_view = sitk.GetArrayViewFromImage(raw_image)
+            if len(np.unique(np_view)) <= 256:
+                img_min, img_max = np.min(np_view), np.max(np_view)
+                bone_mask = sitk.Cast(raw_image > float(img_min + 0.5 * (img_max - img_min)), sitk.sitkUInt8)
+            else:
+                logging.info(f"Applying Triangle Thresholding...")
+                sharpened = sitk.Cast(raw_image, sitk.sitkFloat32)
+                sharpened = sitk.LaplacianSharpening(sitk.LaplacianSharpening(sharpened))
+                triangle = sitk.TriangleThresholdImageFilter()
+                triangle.SetInsideValue(0)
+                triangle.SetOutsideValue(1)
+                bone_mask = triangle.Execute(sharpened)
+
+            # (Housekeeping: Clean main bone islands)
+            cc = sitk.ConnectedComponent(bone_mask)
+            stats = sitk.LabelShapeStatisticsImageFilter()
+            stats.Execute(cc)
+            largest_label = max(stats.GetLabels(), key=lambda l: stats.GetPhysicalSize(l))
+            clean_bone_mask = sitk.BinaryThreshold(cc,
+                                                   lowerThreshold=largest_label, upperThreshold=largest_label,
+                                                   insideValue=1, outsideValue=0)
+
+            sitk.WriteImage(sitk.Cast(clean_bone_mask * 255, sitk.sitkUInt8),
+                            os.path.join(dirs['Filled'], f"{bone_id}.tiff"))
+
+            # --- STEP 2: FILL BONE (SurfaceWrapSolidify) ---
+            logging.info("STEP 1: Executing Surface Wrap Solidify on the external shell...")
+            solid_condyle = slicer_surface_wrap_solidify(clean_bone_mask, wrap_radius=6)
+
+            # --- STEP 3: SUBTRACT TO GET PORES ---
+            logging.info("STEP 2: Subtracting bone to isolate pores...")
+            raw_pores = solid_condyle & ~clean_bone_mask
+
+            # --- STEP 4: REMOVE SMALL ISLANDS (500 VOXELS) ---
+            logging.info("STEP 3: Removing small pore islands (< 500 voxels)...")
+            pores_array = sitk.GetArrayFromImage(raw_pores).astype(bool)
+            cleaned_pores_array = morphology.remove_small_objects(pores_array, min_size=500)
+            cleaned_pores = sitk.GetImageFromArray(cleaned_pores_array.astype(np.uint8))
+            cleaned_pores.CopyInformation(raw_pores)
+
+            # --- STEP 5: SURFACE WRAP SOLIDIFY THE PORES ---
+            logging.info("STEP 4: Executing Surface Wrap Solidify on the pore network...")
+            # We use a radius of 8 here to cleanly bridge the thick trabecular struts
+            medullary_cavity = slicer_surface_wrap_solidify(cleaned_pores, wrap_radius=8)
+
+            # --- STEP 6: MEDIAN SMOOTHING (1, 1, 1) ---
+            logging.info("STEP 5: Applying median smoothing to the Medullary Cavity...")
+            median_filter = sitk.MedianImageFilter()
+            median_filter.SetRadius([1, 1, 1])
+            medullary_cavity = median_filter.Execute(medullary_cavity)
+
+            # Safety check: Cavity cannot exceed the solid outer bone
+            medullary_cavity = medullary_cavity & solid_condyle
+
+            # --- STEP 7: EXTRACT TRABECULAR BONE ---
+            logging.info("STEP 6: Intersecting to extract Trabecular Bone...")
+            trabecular_mask = clean_bone_mask & medullary_cavity
+            trabecular_array = sitk.GetArrayFromImage(trabecular_mask).astype(bool)
+            clean_trabecular_array = morphology.remove_small_objects(trabecular_array, min_size=100)
+            trabecular_mask_clean = sitk.GetImageFromArray(clean_trabecular_array.astype(np.uint8))
+            trabecular_mask_clean.CopyInformation(trabecular_mask)
+            trabecular_mask = trabecular_mask_clean
+
+            # --- STEP 8: EXTRACT CORTICAL BONE ---
+            logging.info("STEP 7: Subtracting to extract Cortical Bone...")
+            cortical_mask = clean_bone_mask & ~medullary_cavity
+            cort_array = sitk.GetArrayFromImage(cortical_mask).astype(bool)
+            clean_cort_array = morphology.remove_small_objects(cort_array, min_size=500)
+            cortical_mask_clean = sitk.GetImageFromArray(clean_cort_array.astype(np.uint8))
+            cortical_mask_clean.CopyInformation(cortical_mask)
+            cortical_mask = cortical_mask_clean
+
+            # --- STEP 10: SAVE SEGMENTATIONS ---
+            logging.info("STEP 8: Saving Cortical and Trabecular outputs...")
+            sitk.WriteImage(sitk.Cast(cortical_mask * 255, sitk.sitkUInt8),
+                            os.path.join(dirs['Cortical'], f"{bone_id}.tiff"))
+            sitk.WriteImage(sitk.Cast(trabecular_mask * 255, sitk.sitkUInt8),
+                            os.path.join(dirs['Trabecular'], f"{bone_id}.tiff"))
+
+            # Cleanup
+            del clean_bone_mask, solid_condyle, raw_pores, pores_array
+            del cleaned_pores_array, cleaned_pores, medullary_cavity
+            del trabecular_mask, cortical_mask, cortical_mask_clean
+            gc.collect()
+
+        except Exception as e:
+            logging.error(f"Error processing {bone_id}: {e}")
+            traceback.print_exc()
+            continue
+
+    logging.info("Segmentation pipeline completed.")
+    return True
+
+def Segment2(input_dir, output_dir, erosion_radius=1):
+    """
+    Automated pipeline to process raw image stacks, apply double Laplacian
+    sharpening, isolate the main bone structure, apply light smoothing, and
+    perform an Erosion-Bounded Shrinkwrap to cleanly separate cortical from
+    trabecular bone in complex geometries like the mandibular condyle.
+    """
+
+    log_file = os.path.join(output_dir, f"Segmentation_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+
+    logging.info(f"Starting Segmentation pipeline. Input: {input_dir} | Output: {output_dir}")
+
+    dirs = {
+        'Raw': os.path.join(output_dir, 'Raw'),
+        'Filled': os.path.join(output_dir, 'Filled'),
+        'Cortical': os.path.join(output_dir, 'Cortical'),
+        'Trabecular': os.path.join(output_dir, 'Trabecular')
+    }
+    for d in dirs.values():
+        os.makedirs(d, exist_ok=True)
+
+    valid_extensions = ('.tiff', '.tif')
+    files = [f for f in os.listdir(input_dir) if f.lower().endswith(valid_extensions)]
+
+    if not files:
+        logging.error(f"No .tiff or .tif files found in {input_dir}.")
+        return False
+
+    for filename in files:
+        bone_id = os.path.splitext(filename)[0]
+        input_path = os.path.join(input_dir, filename)
+
+        try:
+            logging.info(f"--- Processing {bone_id} ---")
+
+            # --- LOAD & SAVE RAW ---
+            raw_image = load_image(input_path)
+            if raw_image is None:
+                logging.error(f"Failed to load {input_path}")
+                continue
+
+            raw_out_path = os.path.join(dirs['Raw'], f"{bone_id}.tiff")
+            sitk.WriteImage(raw_image, raw_out_path)
+
+            # --- CHECK IF ALREADY BINARY ---
+            np_view = sitk.GetArrayViewFromImage(raw_image)
+            unique_vals = np.unique(np_view)
+            is_binary = len(unique_vals) <= 256
+
+            if is_binary:
+                logging.info(f"Image {bone_id} is binary. Handling Binary Input.")
+                img_min = np.min(np_view)
+                img_max = np.max(np_view)
+                threshold_val = img_min + 0.5 * (img_max - img_min)
+
+                bone_mask = raw_image > float(threshold_val)
+                bone_mask = sitk.Cast(bone_mask, sitk.sitkUInt8)
+
+                #bone_mask = raw_image > 0
+                #bone_mask = sitk.Cast(bone_mask, sitk.sitkUInt16)
+
+            else:
+                logging.info(f"Image {bone_id} is Non-binary. Handling Non-Binary Input.")
+                sharpened_img = sitk.Cast(raw_image, sitk.sitkFloat32)
+                sharpened_img = sitk.Cast(sharpened_img, raw_image.GetPixelID())
+                sharpened_img = sitk.LaplacianSharpening(sharpened_img)
+                sharpened_img = sitk.LaplacianSharpening(sharpened_img)
+                triangle_filter = sitk.TriangleThresholdImageFilter()
+                triangle_filter.SetInsideValue(0)
+                triangle_filter.SetOutsideValue(1)
+                bone_mask = triangle_filter.Execute(sharpened_img)
+
+                del sharpened_img
+
+            # --- PROCESS SMALL ISLANDS ---
+            logging.info("Cleaning artifacts outside the main bone structure...")
+            cc = sitk.ConnectedComponent(bone_mask)
+            stats = sitk.LabelShapeStatisticsImageFilter()
+            stats.Execute(cc)
+
+            labels = stats.GetLabels()
+            if not labels:
+                logging.warning(f"No bone detected in {bone_id}. Skipping.")
+                continue
+
+            largest_label = max(labels, key=lambda l: stats.GetPhysicalSize(l))
+            clean_bone_mask = sitk.BinaryThreshold(
+                cc, lowerThreshold=largest_label,
+                upperThreshold=largest_label,
+                insideValue=1, outsideValue=0
+            )
+            del raw_image, bone_mask, cc, stats
+
+            # --- VERY LIGHT SMOOTHING ---
+            logging.info("Applying very light smoothing (Median Radius=1) to the cleaned bone mask...")
+            median_filter = sitk.MedianImageFilter()
+            median_filter.SetRadius([1, 1, 1])
+            clean_bone_mask = median_filter.Execute(clean_bone_mask)
+
+            # --- SAVE FILLED ---
+            filled_safe = sitk.Cast(clean_bone_mask * 255, sitk.sitkUInt8)
+            filled_out_path = os.path.join(dirs['Filled'], f"{bone_id}.tiff")
+            sitk.WriteImage(filled_safe, filled_out_path)
+
+            # --- EROSION-BOUNDED SHRINKWRAP ---
+            logging.info("Identifying the boundaries of internal trabecular bone...")
+
+            # 1. Build the absolute outer hull using the robust Orthogonal Fill
+            closed_bone = sitk.BinaryMorphologicalClosing(clean_bone_mask, [5, 5, 5], sitk.sitkBall)
+            outer_hull = generate_robust_outer_hull(closed_bone)
+
+            # 2. Create the protective firewall
+            internal_hull = sitk.BinaryErode(outer_hull, [erosion_radius, erosion_radius, erosion_radius], sitk.sitkBall)
+
+            # 3. Find pores STRICTLY inside the protective internal hull
+            internal_pores = internal_hull & ~clean_bone_mask
+
+            # 4. Clean up the internal pores
+            closed_pores = sitk.BinaryMorphologicalClosing(internal_pores, [3, 3, 3], sitk.sitkBall)
+            filled_pores = sitk.BinaryFillhole(closed_pores, fullyConnected=True)
+
+            pores_array = sitk.GetArrayFromImage(filled_pores).astype(bool)
+            cleaned_pores_array = morphology.remove_small_objects(pores_array, min_size=500)
+            cleaned_pores = sitk.GetImageFromArray(cleaned_pores_array.astype(np.uint8))
+            cleaned_pores.CopyInformation(filled_pores)
+
+            logging.info("Segmenting the trabecular bone...")
+
+            # 5. Build the final medullary cavity
+            medullary_base = cleaned_pores > 0
+            medullary_closed = sitk.BinaryMorphologicalClosing(medullary_base, [10, 10, 10], sitk.sitkBall)
+            medullary_cavity = sitk.BinaryFillhole(medullary_closed, fullyConnected=True)
+
+            # Intersect with internal_hull to guarantee it never touches the outer cortical plate
+            medullary_cavity = medullary_cavity & internal_hull
+
+            cavity_safe = sitk.Cast(medullary_cavity * 255, sitk.sitkUInt8)
+            sitk.WriteImage(cavity_safe, os.path.join("B:/", f"{bone_id}_02_Medullary_Cavity.tiff"))
+
+            #medullary_cavity = internal_hull
+
+            # 6. Extract the final structures
+            trabecular_mask = clean_bone_mask & medullary_cavity
+            cortical_mask = clean_bone_mask & ~medullary_cavity
+
+            logging.info("Saving all segmentations...")
+
+            # --- SAVE CORTICAL AND TRABECULAR ---
+            cortical_safe = sitk.Cast(cortical_mask * 255, sitk.sitkUInt8)
+            trabecular_safe = sitk.Cast(trabecular_mask * 255, sitk.sitkUInt8)
+
+            cortical_out_path = os.path.join(dirs['Cortical'], f"{bone_id}.tiff")
+            trabecular_out_path = os.path.join(dirs['Trabecular'], f"{bone_id}.tiff")
+
+            sitk.WriteImage(cortical_safe, cortical_out_path)
+            sitk.WriteImage(trabecular_safe, trabecular_out_path)
+
+            logging.info(f"Saved Cortical bone to {cortical_out_path}")
+            logging.info(f"Saved Trabecular bone to {trabecular_out_path}")
+
+            # Cleanup
+            del clean_bone_mask, closed_bone, outer_hull, internal_hull
+            del internal_pores, closed_pores, filled_pores, pores_array
+            del cleaned_pores_array, cleaned_pores, medullary_base, medullary_closed
+            del medullary_cavity, trabecular_mask, cortical_mask
+            del filled_safe, cortical_safe, trabecular_safe
+            gc.collect()
+
+        except Exception as e:
+            logging.error(f"Error processing {bone_id}: {e}")
+            traceback.print_exc()
+            continue
+
+    logging.info("Segmentation pipeline completed.")
+    return True
 
 ###############################
 # Resampling Function
@@ -911,7 +1285,7 @@ def align(input_dir, output_dir, reference_name, scale_factor=5, cores='detect')
     Includes an iterative refinement loop to ensure a minimum Dice score.
     """
     # Configure logging
-    log_file = os.path.join(output_dir, f"align_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    log_file = os.path.join(output_dir, f"Alignment_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -1090,6 +1464,12 @@ def align(input_dir, output_dir, reference_name, scale_factor=5, cores='detect')
                         sitk.sitkLinear, 0.0, moving_image_full.GetPixelID()
                     )
                     dice, _, _ = compute_metrics(transformed_image_check, reference_image)
+
+                    # Prevent the Python NoneType Formatting Crash
+                    if dice is None:
+                        logging.warning(f"Attempt {attempt + 1} failed: Metrics could not be computed.")
+                        continue
+
                     logging.info(f"Attempt {attempt + 1} Dice: {dice:.4f}")
 
                     if dice > best_dice_so_far:
@@ -1132,7 +1512,7 @@ def align(input_dir, output_dir, reference_name, scale_factor=5, cores='detect')
                             metrics["msd"].append(msd)
                             logging.info(f"Final metrics for {bone}: Dice={dice:.4f}, HD={hd:.4f}, MSD={msd:.4f}")
 
-                    output_subdir = os.path.join(output_dir, "Alignment", dir_name)
+                    output_subdir = os.path.join(output_dir, dir_name)
                     os.makedirs(output_subdir, exist_ok=True)
                     sitk.WriteImage(transformed_image, os.path.join(output_subdir, f"{bone}.tiff"))
 
@@ -1405,7 +1785,7 @@ def load_image(file_path):
     """Load an image using SimpleITK and set the expected spacing."""
     try:
         if not os.path.exists(file_path):
-            logging.error(f"File does not exist: {file_path}")
+            #logging.error(f"File does not exist: {file_path}")
             return None
         image = sitk.ReadImage(file_path)
         spacing = image.GetSpacing()
@@ -1886,13 +2266,92 @@ def calculate_volume(image, threshold=0):
     voxel_array = sitk.GetArrayViewFromImage(image)
     return np.sum(voxel_array > threshold)
 
-
 def canonical_trabecular(Canonical_Bone, Averaged_Trabecular, output_path="trabecular.tiff"):
     """
-    Generates a canonical trabecular bone network from two inputs.
-    :param Canonical_Bone The path location of the Canonical Bone (cortical + trabecular)
-    :param Averaged_Trabecular The path location of the Averaged Trabecular bone post BSpline Deformation
-    :param output_path The path location for the output files: a solid trabecular bone and the canonical bone
+    Generates a canonical trabecular bone network from two specific inputs using
+    the pure-Python Slicer Surface Wrap Solidify logic to cleanly isolate the
+    medullary cavity without leaking.
+    """
+    logging.info(f"Loading Canonical Bone: {Canonical_Bone}")
+
+    # Load the 3D images (assuming load_image is defined in your script)
+    avg_bone_vol = load_image(Canonical_Bone)
+    avg_bone_vol = sitk.Cast(avg_bone_vol, sitk.sitkUInt8)
+    bone = avg_bone_vol > 5
+
+    logging.info(f"Loading Averaged Trabecular: {Averaged_Trabecular}")
+    messy_trab_vol = load_image(Averaged_Trabecular)
+    messy_trab_vol = sitk.Cast(messy_trab_vol, sitk.sitkUInt8)
+    messy_trabecular_mask = messy_trab_vol > 1
+
+    # ---------------------------------------------------------
+    # STEP 1: Process the Canonical Bone Input
+    # ---------------------------------------------------------
+    logging.info("STEP 1: Solidifying Canonical Bone Outer Hull...")
+    solid_condyle = slicer_surface_wrap_solidify(bone, wrap_radius=6)
+
+    # ---------------------------------------------------------
+    # STEP 2: Isolate the Pore Network
+    # ---------------------------------------------------------
+    logging.info("STEP 2: Isolating internal pores...")
+    raw_pores = solid_condyle & ~bone
+
+    logging.info("Removing small pore islands (< 500 voxels)...")
+    pores_array = sitk.GetArrayFromImage(raw_pores).astype(bool)
+    cleaned_pores_array = morphology.remove_small_objects(pores_array, min_size=500)
+    cleaned_pores = sitk.GetImageFromArray(cleaned_pores_array.astype(np.uint8))
+    cleaned_pores.CopyInformation(raw_pores)
+
+    # ---------------------------------------------------------
+    # STEP 3: Surface Wrap Solidify the Pores (Medullary Cavity)
+    # ---------------------------------------------------------
+    logging.info("STEP 3: Building the final confined medullary cavity...")
+    medullary_cavity = slicer_surface_wrap_solidify(cleaned_pores, wrap_radius=8)
+
+    logging.info("Applying median smoothing to the Medullary Cavity...")
+    median_filter = sitk.MedianImageFilter()
+    median_filter.SetRadius([1, 1, 1])
+    medullary_cavity = median_filter.Execute(medullary_cavity)
+
+    medullary_cavity = medullary_cavity & solid_condyle
+
+    # ---------------------------------------------------------
+    # STEP 4: Conduct Trabecular Segmentation
+    # ---------------------------------------------------------
+    logging.info("STEP 4: Segmenting the Canonical Trabecular Bone...")
+    trabecular = messy_trabecular_mask & medullary_cavity
+
+    trab_array = sitk.GetArrayFromImage(trabecular).astype(bool)
+    clean_trab_array = morphology.remove_small_objects(trab_array, min_size=100)
+    trabecular_clean = sitk.GetImageFromArray(clean_trab_array.astype(np.uint8))
+    trabecular_clean.CopyInformation(trabecular)
+    trabecular = trabecular_clean
+
+    # ---------------------------------------------------------
+    # STEP 5: Save the Output
+    # ---------------------------------------------------------
+    trabecular_safe = sitk.Cast(trabecular * 255, sitk.sitkUInt8)
+    trabecular_filled_safe = sitk.Cast(medullary_cavity * 255, sitk.sitkUInt8)
+
+    sitk.WriteImage(trabecular_filled_safe, output_path)
+    logging.info(f"Saved isoHMA Function Ready Trabecular Bone to {output_path}...")
+
+    canonical_path_dir = os.path.dirname(os.path.abspath(output_path))
+    new_path = os.path.join(canonical_path_dir, "Canonical_Trabecular_Image.tiff")
+    sitk.WriteImage(trabecular_safe, new_path)
+    logging.info(f"Saved Canonical Trabecular Bone to {new_path}...")
+
+    del bone, solid_condyle, raw_pores, pores_array, cleaned_pores_array, cleaned_pores
+    del medullary_cavity, trabecular_safe, trabecular_filled_safe
+    gc.collect()
+
+    return None
+
+def canonical_trabecular2(Canonical_Bone, Averaged_Trabecular, output_path="trabecular.tiff", erosion_radius=1):
+    """
+    Generates a canonical trabecular bone network from two inputs using an
+    Erosion-Bounded Shrinkwrap to cleanly isolate the medullary cavity and
+    prevent the trabecular mask from bleeding into the cortical shell.
     """
     logging.info("Loading Image Volumes")
     # Load the 3D images
@@ -1906,52 +2365,52 @@ def canonical_trabecular(Canonical_Bone, Averaged_Trabecular, output_path="trabe
     # STEP 1: Process the Canonically Averaged Bone Input
     # ---------------------------------------------------------
     logging.info("Segmenting The Canonical Bone")
-    # Create the initial bone segment using a threshold of > 5
     bone = avg_bone_vol > 5
 
-    logging.info("Solidifying Canonical Bone...")
-    closed_bone = sitk.BinaryMorphologicalClosing(bone, [5, 5, 5], sitk.sitkBall)
-    total_volume = sitk.BinaryFillhole(closed_bone, fullyConnected=True)
+    logging.info("Solidifying Canonical Bone Outer Hull...")
+    # Utilize the robust orthogonal 2.5D fill to seal open necks perfectly
+    closed_bone = sitk.BinaryMorphologicalClosing(bone, [3, 3, 3], sitk.sitkBall)
+    outer_hull = generate_robust_outer_hull(closed_bone)
 
     # ---------------------------------------------------------
-    # STEP 2: Segment Medullary Area
+    # STEP 2: Erosion-Bounded Shrinkwrap for Medullary Area
     # ---------------------------------------------------------
+    logging.info(f"Applying protective erosion (radius={erosion_radius}) to peel away cortical shell...")
+    internal_hull = sitk.BinaryErode(outer_hull, [erosion_radius, erosion_radius, erosion_radius], sitk.sitkBall)
 
-    logging.info("Segmenting the Medullary Area of Bone")
-    # Pores = Total Volume minus Bone
-    pores = total_volume & ~bone
+    logging.info("Isolating internal pores...")
+    internal_pores = internal_hull & ~bone
 
-    # Fill porous region
-    closed_pores = sitk.BinaryMorphologicalClosing(pores, [5,5,5], sitk.sitkBall)
+    closed_pores = sitk.BinaryMorphologicalClosing(internal_pores, [3, 3, 3], sitk.sitkBall)
     filled_pores = sitk.BinaryFillhole(closed_pores, fullyConnected=True)
 
-    # Remove small islands from the filled pores (minimum size 500 voxels)
-    filled_pores_array = sitk.GetArrayFromImage(filled_pores).astype(bool)
-    cleaned_pores_array = morphology.remove_small_objects(filled_pores_array, min_size=500)
+    pores_array = sitk.GetArrayFromImage(filled_pores).astype(bool)
+    cleaned_pores_array = morphology.remove_small_objects(pores_array, min_size=500)
     cleaned_pores = sitk.GetImageFromArray(cleaned_pores_array.astype(np.uint8))
     cleaned_pores.CopyInformation(filled_pores)
+
+    logging.info("Building the final confined medullary cavity...")
+    medullary_base = cleaned_pores > 0
+    # Boosted to [5, 5, 5] to safely engulf thick, dense trabecular nodes
+    medullary_closed = sitk.BinaryMorphologicalClosing(medullary_base, [5, 5, 5], sitk.sitkBall)
+    medullary_cavity = sitk.BinaryFillhole(medullary_closed, fullyConnected=True)
+
+    # CRITICAL: Intersect with internal_hull to guarantee it never touches the outer cortical plate
+    medullary_cavity = medullary_cavity & internal_hull
 
     # ---------------------------------------------------------
     # STEP 3: Conduct Trabecular Segmentation
     # ---------------------------------------------------------
     logging.info("Segmenting the Canonical Trabecular Bone")
-
     messy_trabecular_mask = messy_trab_vol > 1
+    trabecular = messy_trabecular_mask & medullary_cavity
 
-    # Intersect the messy trabecular bone with the cleaned pore network mask
-    trabecular = messy_trabecular_mask & cleaned_pores
-    trabecular = trabecular * 255
-
-    Filled = sitk.Cast(trabecular, sitk.sitkUInt8)
-    Filled = Filled > 0
-    trabecular_filled = sitk.BinaryMorphologicalClosing(Filled, [10, 10, 10], sitk.sitkBall)
-    trabecular_filled = sitk.BinaryFillhole(trabecular_filled, fullyConnected=True)
-    #trabecular_filled = trabecular_filled * 255
     # ---------------------------------------------------------
     # STEP 4: Save the Output
     # ---------------------------------------------------------
-    trabecular = sitk.Cast(trabecular, sitk.sitkUInt8)
-    trabecular_filled = sitk.Cast(trabecular_filled, sitk.sitkUInt8)
+    trabecular = sitk.Cast(trabecular * 255, sitk.sitkUInt8)
+    trabecular_filled = sitk.Cast(medullary_cavity * 255, sitk.sitkUInt8)
+
     sitk.WriteImage(trabecular_filled, output_path)
 
     canonical_path = os.path.dirname(output_path)
@@ -2501,21 +2960,39 @@ def invert_displacement_field(displacement_field):
         logging.warning("Returning identity transform as fallback")
         return sitk.Transform(3, sitk.sitkIdentity)
 
+
 def compute_metrics(fixed_image, moving_image, scale_factor=5):
     """Compute metrics between two images with robust error handling."""
-    try:   
+    try:
+        # Downscale
         rfix = resample_image(fixed_image, scale_factor)
-        fixed_mask = fill(rfix)
-        fixed_mask = sitk.Cast(fixed_mask, sitk.sitkUInt8)
-        
         rmove = resample_image(moving_image, scale_factor)
-        moving_mask = fill(rmove)
-        moving_mask = sitk.Cast(moving_mask, sitk.sitkUInt8)
 
-        # Compute Dice coefficient        
+        # Binarize to 0 and 1! This fixes the 0.4548 Dice bug and makes fill() work correctly
+        rfix_bin = sitk.BinaryThreshold(rfix, lowerThreshold=1, insideValue=1, outsideValue=0)
+        rmove_bin = sitk.BinaryThreshold(rmove, lowerThreshold=1, insideValue=1, outsideValue=0)
+
+        # Fill holes and cast
+        fixed_mask = sitk.Cast(fill(rfix_bin), sitk.sitkUInt8)
+        moving_mask = sitk.Cast(fill(rmove_bin), sitk.sitkUInt8)
+
+        # PREVENT HAUSDORFF CRASH: Check if either image is completely blank
+        stats = sitk.StatisticsImageFilter()
+        stats.Execute(fixed_mask)
+        fixed_sum = stats.GetSum()
+
+        stats.Execute(moving_mask)
+        moving_sum = stats.GetSum()
+
+        if fixed_sum == 0 or moving_sum == 0:
+            logging.warning("One of the images is completely empty (pushed out of bounds).")
+            return None, None, None
+
+        # Compute Dice coefficient
         dice_filter = sitk.LabelOverlapMeasuresImageFilter()
         dice_filter.Execute(fixed_mask, moving_mask)
-        dice = dice_filter.GetDiceCoefficient()
+        dice = dice_filter.GetDiceCoefficient()  # Defaults to checking label 1
+        dice = abs(dice)
 
         # Compute Hausdorff Distance and Mean Surface Distance
         hausdorff = sitk.HausdorffDistanceImageFilter()
@@ -2524,6 +3001,7 @@ def compute_metrics(fixed_image, moving_image, scale_factor=5):
         msd = hausdorff.GetAverageHausdorffDistance()
 
         return dice, hd, msd
+
     except Exception as e:
         logging.error(f"Error computing metrics: {e}")
         traceback.print_exc()
@@ -2904,22 +3382,20 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
             # =====================================================================
 
             logging.info(f"A6. Creating Canonical Bone for Iteration {iteration}")
-            
-            #==================================================
-            # Average BSpline transformed images
-            gc.collect()
 
-            #==================================================
+            # ==================================================
             # Average BSpline Transforms through displacement field conversion
             gc.collect()
             logging.info("Converting BSpline Transforms to Displacement Fields")
-            
+
             try:
-                # Make displacement fields from B-spline transforms
-                displacement_fields = []
+                # Accumulate displacement fields one by one to save RAM
+                sum_displacement_field = None
+                num_valid_fields = 0
+
                 for bone, bspline_transform in bspline_transforms.items():
                     try:
-                        displacement_field = sitk.TransformToDisplacementField(
+                        current_field = sitk.TransformToDisplacementField(
                             bspline_transform,
                             sitk.sitkVectorFloat64,
                             canonical_image.GetSize(),
@@ -2927,44 +3403,73 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
                             canonical_image.GetSpacing(),
                             canonical_image.GetDirection()
                         )
-                        displacement_fields.append(displacement_field)
+
+                        # Add to running total
+                        if sum_displacement_field is None:
+                            sum_displacement_field = current_field
+                        else:
+                            sum_displacement_field = sitk.Add(sum_displacement_field, current_field)
+
+                        num_valid_fields += 1
+
+                        # CRITICAL: Delete the current field and force garbage collection
+                        del current_field
+                        gc.collect()
+
                     except Exception as e:
                         logging.warning(f"Error converting B-spline to displacement field for {bone}: {e}")
                         continue
-            
+
                 logging.info("Creating averaged inverted transform")
-    
-                if displacement_fields:
-                    #============================
-                    # Average displacement fields
-                    avg_displacement_field = average_displacement_fields(displacement_fields)
-                    del displacement_fields
-                    #============================
+
+                if num_valid_fields > 0:
+                    # ============================
+                    # Average the accumulated displacement field
+                    # FIX: Use Numpy to divide to bypass SimpleITK's VectorFloat64 limitation
+                    sum_arr = sitk.GetArrayFromImage(sum_displacement_field)
+                    avg_arr = sum_arr / float(num_valid_fields)
+
+                    # Convert back to an image, explicitly defining it as a Vector
+                    avg_displacement_field = sitk.GetImageFromArray(avg_arr, isVector=True)
+                    avg_displacement_field.CopyInformation(sum_displacement_field)
+
+                    # Clean up the massive arrays to free up memory
+                    del sum_displacement_field, sum_arr, avg_arr
+                    gc.collect()
+
+                    # ============================
                     # Invert with better parameters
                     inverted_transform = invert_displacement_field(avg_displacement_field)
                     logging.info("Successfully created averaged inverted transform")
-                    #============================
+
+                    # Clean up the average field
+                    del avg_displacement_field
+                    gc.collect()
+
+                    # ============================
                     # Apply transform with extra safeguards
                     logging.info("Creating canonical image")
-                    inverted_image = apply_transform(canonical_image, inverted_transform, interpolator=sitk.sitkNearestNeighbor)
-                    #============================
+                    inverted_image = apply_transform(canonical_image,
+                                                     inverted_transform,
+                                                     interpolator=sitk.sitkNearestNeighbor)
+                    # ============================
                     # Verify inverted image has content
                     stats = sitk.StatisticsImageFilter()
                     stats.Execute(inverted_image)
                     if stats.GetSum() < 1:
-                        logging.warning("Inverted image is empty! Using averaged image instead.")
-                        new_canonical_image = averaged_image
+                        logging.warning("Inverted image is empty! Using previous canonical image instead.")
+                        new_canonical_image = canonical_image  # FIX: Updated from averaged_image
                     else:
                         new_canonical_image = inverted_image
                         logging.info("Successfully created the canonical image")
                 else:
                     logging.error("No valid displacement fields for inversion. Stopping analysis.")
                     break
-                    
+
             except Exception as e:
                 logging.warning(f"Error in displacement field processing: {e}")
-                logging.warning("Using cleaned averaged image as canonical")
-                new_canonical_image = averaged_image
+                logging.warning("Using previous canonical image as fallback")
+                new_canonical_image = canonical_image  # FIX: Updated from averaged_image
 
             logging.info(f"Successfully created canonical bone image for iteration {iteration}")
 
@@ -3081,7 +3586,7 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
             )
             
             # Load final transforms from last iteration
-            last_iteration = 2
+            last_iteration = len(convergence["iteration"])
             similarity_path = os.path.join(
                 output_dir, "Similarity_Transform", "Transforms2", 
                 f"{bone}_iter{last_iteration}.tfm"
@@ -3150,6 +3655,7 @@ def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_
         end_time = time.time()
         total_time = end_time - start_time
         logging.info(f"cHMA analysis completed in {total_time/60:.2f} minutes")
+        logging.info(f"cHMA Analysis Took {len(convergence["iteration"])} Iterations to reach convergence.")
         gc.collect()
         
         return True
