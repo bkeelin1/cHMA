@@ -187,17 +187,39 @@ The cHMA package was made exclusively for the Python 3.9 programming
 language. This package consists of four primary functions to carry out
 an entire cHMA analysis as described above:
 
-1.  **resample:** Resample all 3D images to the same dimensions, size,
+1. **Segment:** Segment Trabecular from Cortical Bone in any image less than 500 microns resolution.
+   Input format is singular image stack files (.tiff) in a file directory
+
+3.  **resample:** Resample all 3D images to the same dimensions, size,
     and spacing.
 
-2.  **align:** Iteratively align all 3D images in the same orientation. 
+4.  **align:** Iteratively align all 3D images in the same orientation. 
 
-3.  **cHMA:** Create the canonical bone image.
+5.  **cHMA:** Create the canonical bone image.
 
-4.  **isoHMA:** Conduct Holistic Morphometric Analysis by generating a
+6.  **isoHMA:** Conduct Holistic Morphometric Analysis by generating a
     canonical and isotopological bone meshes.
 
-5.  **smesh:** Assign scalar values to the canonical mesh.
+7.  **smesh:** Assign scalar values to the canonical mesh.
+
+## Segment:
+```python
+def Segment(input_dir, output_dir):
+    """
+    Shrinkwrap Segment the trabecular bone from cortical bone. Uses image filtering on poor resolution volumes.
+    
+    Parameters:
+    -----------
+    input_dir : str
+        Path to input tiff image stack (as a singular file, not a list of images)
+    output_dir : str
+        Output Path to put segmented tiff image stacks (as a singular file, not a list of images)
+    """
+    Returns:
+    --------
+        This function creates 4 folders: Cortical (Cortical Bone shell), Filled (Binary trabecular+cortical bone), Trabecular (Trabecular Bone), and Raw (original tiff files).
+    """
+```
 
 ## resample:
 
@@ -221,7 +243,6 @@ def resample_condyles(input_dir, output_dir, expected_spacing, cores='detect'):
     --------
     str
         Path to the created output file
-    """
     """
 ```
 
@@ -345,6 +366,20 @@ def scalar_mesh(input_file, pc_loadings, output_file, pc_name="PC1"):
 ## Example: **Canonical Holistic Morphometric Analysis (cHMA) of binary image masks of Right Mandibular Condyles**
 
 ------------------------------------------------------------------------
+
+## **Optional Step: Segment the Trabecular Bone from Cortical Bone**
+```python
+import cHMA
+import gc
+
+input_dir = "Your Input Directory in quotations"
+output_dir = "Your Output Directory in quotations"
+
+gc.collect()
+cHMA.Segment(input_dir,output_dir)
+gc.collect()
+```
+
 
 ## **Step 1: Resample all images to same dimensions and size**
 
