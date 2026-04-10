@@ -2272,31 +2272,32 @@ def canonical_trabecular(Canonical_Bone, Averaged_Trabecular, output_path="trabe
     the pure-Python Slicer Surface Wrap Solidify logic to cleanly isolate the
     medullary cavity without leaking.
     """
-    logging.info(f"Loading Canonical Bone: {Canonical_Bone}")
-
     # Load the 3D images (assuming load_image is defined in your script)
     avg_bone_vol = load_image(Canonical_Bone)
-    avg_bone_vol = sitk.Cast(avg_bone_vol, sitk.sitkUInt8)
-    bone = avg_bone_vol > 5
+    np_view = sitk.GetArrayViewFromImage(avg_bone_vol)
+    img_min, img_max = np.min(np_view), np.max(np_view)
+    bone = sitk.Cast(avg_bone_vol > float(img_min + 0.5 * (img_max - img_min)), sitk.sitkUInt8)
 
-    logging.info(f"Loading Averaged Trabecular: {Averaged_Trabecular}")
     messy_trab_vol = load_image(Averaged_Trabecular)
-    messy_trab_vol = sitk.Cast(messy_trab_vol, sitk.sitkUInt8)
-    messy_trabecular_mask = messy_trab_vol > 1
+    sharpened = sitk.Cast(messy_trab_vol, sitk.sitkFloat32)
+    sharpened = sitk.LaplacianSharpening(sitk.LaplacianSharpening(sharpened))
+    triangle = sitk.TriangleThresholdImageFilter()
+    triangle.SetInsideValue(0)
+    triangle.SetOutsideValue(1)
+    messy_trab_vol = triangle.Execute(sharpened)
+    np_view = sitk.GetArrayViewFromImage(messy_trab_vol)
+    img_min, img_max = np.min(np_view), np.max(np_view)
+    messy_trab_vol = sitk.Cast(messy_trab_vol > float(img_min + 0.5 * (img_max - img_min)), sitk.sitkUInt8)
 
     # ---------------------------------------------------------
     # STEP 1: Process the Canonical Bone Input
     # ---------------------------------------------------------
-    logging.info("STEP 1: Solidifying Canonical Bone Outer Hull...")
     solid_condyle = slicer_surface_wrap_solidify(bone, wrap_radius=6)
 
     # ---------------------------------------------------------
     # STEP 2: Isolate the Pore Network
     # ---------------------------------------------------------
-    logging.info("STEP 2: Isolating internal pores...")
     raw_pores = solid_condyle & ~bone
-
-    logging.info("Removing small pore islands (< 500 voxels)...")
     pores_array = sitk.GetArrayFromImage(raw_pores).astype(bool)
     cleaned_pores_array = morphology.remove_small_objects(pores_array, min_size=500)
     cleaned_pores = sitk.GetImageFromArray(cleaned_pores_array.astype(np.uint8))
@@ -2305,22 +2306,15 @@ def canonical_trabecular(Canonical_Bone, Averaged_Trabecular, output_path="trabe
     # ---------------------------------------------------------
     # STEP 3: Surface Wrap Solidify the Pores (Medullary Cavity)
     # ---------------------------------------------------------
-    logging.info("STEP 3: Building the final confined medullary cavity...")
-    medullary_cavity = slicer_surface_wrap_solidify(cleaned_pores, wrap_radius=8)
-
-    logging.info("Applying median smoothing to the Medullary Cavity...")
+    medullary_cavity = slicer_surface_wrap_solidify(cleaned_pores, wrap_radius=6)
     median_filter = sitk.MedianImageFilter()
     median_filter.SetRadius([1, 1, 1])
     medullary_cavity = median_filter.Execute(medullary_cavity)
 
-    medullary_cavity = medullary_cavity & solid_condyle
-
     # ---------------------------------------------------------
     # STEP 4: Conduct Trabecular Segmentation
     # ---------------------------------------------------------
-    logging.info("STEP 4: Segmenting the Canonical Trabecular Bone...")
-    trabecular = messy_trabecular_mask & medullary_cavity
-
+    trabecular = messy_trabecular_vol & medullary_cavity
     trab_array = sitk.GetArrayFromImage(trabecular).astype(bool)
     clean_trab_array = morphology.remove_small_objects(trab_array, min_size=100)
     trabecular_clean = sitk.GetImageFromArray(clean_trab_array.astype(np.uint8))
@@ -2334,7 +2328,7 @@ def canonical_trabecular(Canonical_Bone, Averaged_Trabecular, output_path="trabe
     trabecular_filled_safe = sitk.Cast(medullary_cavity * 255, sitk.sitkUInt8)
 
     sitk.WriteImage(trabecular_filled_safe, output_path)
-    logging.info(f"Saved isoHMA Function Ready Trabecular Bone to {output_path}...")
+    logging.info(f"Saved Solid Canonical Trabecular Bone to {output_path}...")
 
     canonical_path_dir = os.path.dirname(os.path.abspath(output_path))
     new_path = os.path.join(canonical_path_dir, "Canonical_Trabecular_Image.tiff")
@@ -3007,7 +3001,7 @@ def compute_metrics(fixed_image, moving_image, scale_factor=5):
         traceback.print_exc()
         return None, None, None
 
-def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=3, max_iterations=5, cp=[1,1,1], cores='detect'):
+def cHMA(input_dir, output_dir, reference_name="reference", scale_factor=10, max_iterations=5, cp=[2,2,2], cores='detect'):
     """
     Perform Canonical Holistic Morphometric Analysis (cHMA) on trabecular bone images.
     Modified to use ID.tiff naming convention.
@@ -3701,8 +3695,6 @@ def create_directories1(output_dir):
 def create_bone_presence_mask(trabecular_image, mesh):
     """Generate a mask showing where bone is present vs. absent"""
     try:
-        logging.info("Creating bone presence mask...")
-
         # Get image properties
         spacing = trabecular_image.GetSpacing()
         origin = trabecular_image.GetOrigin()
@@ -3727,9 +3719,6 @@ def create_bone_presence_mask(trabecular_image, mesh):
             start_idx = batch_idx * batch_size
             end_idx = min((batch_idx + 1) * batch_size, len(mesh['vertices']))
 
-            if batch_idx % 5 == 0:
-                logging.info(f"Processing mask batch {batch_idx + 1}/{total_batches}")
-
             # For each vertex in batch
             for i in range(start_idx, end_idx):
                 vertex = mesh['vertices'][i]
@@ -3748,7 +3737,6 @@ def create_bone_presence_mask(trabecular_image, mesh):
                     # Skip vertices that can't be mapped to image indices
                     continue
 
-        logging.info(f"Created bone presence mask with {np.sum(mask)} vertices in bone regions")
         return mask
 
     except Exception as e:
@@ -3775,9 +3763,6 @@ def calculate_confidence_scores(mesh, trabecular_image, grid_points, grid_values
         for batch_idx in range(total_batches):
             start_idx = batch_idx * batch_size
             end_idx = min((batch_idx + 1) * batch_size, len(mesh['vertices']))
-
-            if batch_idx % 5 == 0:
-                logging.info(f"Processing confidence batch {batch_idx + 1}/{total_batches}")
 
             # Get vertices in this batch
             batch_vertices = mesh['vertices'][start_idx:end_idx]
@@ -3868,6 +3853,41 @@ def apply_transform(image, transform, reference_image=None, interpolator=sitk.si
 
 
 def find_transforms_for_bone(input_dir, bone_name, iteration):
+    """
+    Finds the B-spline transform for a given bone with fixed variable tracking.
+    """
+    try:
+        possible_patterns = [
+            f"{bone_name}",
+            f"{bone_name.split('_')[0]}",
+            f"{bone_name.replace('.tiff', '')}"
+        ]
+
+        bspline_tfm_path = None
+
+        # Try to find B-spline transform
+        bspline_dir = os.path.join(input_dir, "BSpline_Transform", "Transforms")
+        for pattern in possible_patterns:
+            for suffix in [f"_iter{iteration}.tfm", ".tfm"]:
+                transform_path = os.path.join(bspline_dir, f"{pattern}{suffix}")
+                if os.path.exists(transform_path):
+                    bspline_tfm_path = transform_path
+                    break
+            if bspline_tfm_path:
+                break
+
+        if bspline_tfm_path:
+            return sitk.ReadTransform(bspline_tfm_path)
+        else:
+            logging.error(f"Could not find B-spline transform for {bone_name}")
+            return None
+
+    except Exception as e:
+        logging.error(f"Error finding transforms for {bone_name}: {e}")
+        traceback.print_exc()
+        return None
+
+def find_transforms_for_bone2(input_dir, bone_name, iteration):
     """
     Find transform files for a given bone with flexible naming pattern matching.
 
@@ -4479,8 +4499,6 @@ def create_solid_tetrahedral_mesh(image, method="tetgen", edge_length=1.0, outpu
         # Adjust vertices for origin offset
         verts = verts + np.array(origin)
 
-        logging.info(f"Surface mesh created with {len(verts)} vertices and {len(faces)} triangles")
-
         # Create tetrahedral mesh using selected method
         if method == "tetgen":
             import tetgen
@@ -4492,8 +4510,8 @@ def create_solid_tetrahedral_mesh(image, method="tetgen", edge_length=1.0, outpu
             nodes, elements = tgen.tetrahedralize(
                 quality=True,
                 plc=True,  # Preserve input geometry
-                minratio=1.0,  # Quality constraint
-                mindihedral=30.0,  # Minimum angle
+                minratio=1.2,  # Quality constraint
+                mindihedral=25.0,  # Minimum angle
                 maxvolume=edge_length ** 3,  # Control element size
                 steinerleft=100000,  # Allow sufficient refinement points
                 nobisect=False  # Allow boundary refinement
@@ -4574,7 +4592,15 @@ def create_solid_tetrahedral_mesh(image, method="tetgen", edge_length=1.0, outpu
                 # Fall back to TetGen
                 import tetgen
                 tgen = tetgen.TetGen(verts, faces)
-                nodes, elements = tgen.tetrahedralize(quality=True, minratio=2.0, mindihedral=10.0)
+                nodes, elements = tgen.tetrahedralize(
+                    quality=True,
+                    plc=True,  # Preserve input geometry
+                    minratio=1.2,  # Allows slightly varying edge lengths for better volume fitting
+                    mindihedral=25.0,  # Standard high-quality angle (prevents over-constraining)
+                    maxvolume=edge_length ** 3,  # Control element size
+                    steinerleft=100000,  # Allow sufficient refinement points
+                    nobisect=False  # Allow boundary refinement
+                )
 
                 mesh_dict = {
                     "vertices": nodes,
@@ -4656,7 +4682,15 @@ def create_solid_tetrahedral_mesh(image, method="tetgen", edge_length=1.0, outpu
                 # Fall back to TetGen
                 import tetgen
                 tgen = tetgen.TetGen(verts, faces)
-                nodes, elements = tgen.tetrahedralize(quality=True, minratio=2.0, mindihedral=10.0)
+                nodes, elements = tgen.tetrahedralize(
+                    quality=True,
+                    plc=True,  # Preserve input geometry
+                    minratio=1.2,  # Allows slightly varying edge lengths for better volume fitting
+                    mindihedral=25.0,  # Standard high-quality angle (prevents over-constraining)
+                    maxvolume=edge_length ** 3,  # Control element size
+                    steinerleft=100000,  # Allow sufficient refinement points
+                    nobisect=False  # Allow boundary refinement
+                )
 
                 mesh_dict = {
                     "vertices": nodes,
@@ -5320,8 +5354,61 @@ def displace(mesh, displacement_field, sigma=1.0):
     }
 
 
-def isomorph(mesh, canonical_image, individual_image, transforms_dir, bone_name, iteration, debug_dir=None):
-    """Enhanced function to morph canonical mesh to individual trabecular space."""
+def center_mesh_to_image(mesh, image):
+    """
+    Pure translation alignment. Shifts the mesh so its geometric center
+    perfectly matches the center of the target trabecular image mask.
+    Does not scale or distort the B-spline morphed tetrahedra.
+    """
+
+
+
+    # 1. Find the physical center of the actual bone in the image
+    array = sitk.GetArrayFromImage(image)
+    if np.sum(array) == 0:
+        logging.warning("Image is empty. Skipping centering.")
+        return mesh
+
+    indices = np.nonzero(array)
+    z_min, y_min, x_min = np.min(indices, axis=1)
+    z_max, y_max, x_max = np.max(indices, axis=1)
+
+    spacing = image.GetSpacing()
+    origin = image.GetOrigin()
+
+    content_center = [
+        origin[0] + ((x_min + x_max) / 2.0) * spacing[0],
+        origin[1] + ((y_min + y_max) / 2.0) * spacing[1],
+        origin[2] + ((z_min + z_max) / 2.0) * spacing[2]
+    ]
+
+    # 2. Find the geometric center of the morphed mesh
+    mesh_vertices = mesh['vertices']
+    mesh_min = np.min(mesh_vertices, axis=0)
+    mesh_max = np.max(mesh_vertices, axis=0)
+    mesh_center = (mesh_min + mesh_max) / 2.0
+
+    # 3. Calculate the required slide (translation vector)
+    translation_vector = np.array(content_center) - np.array(mesh_center)
+    shifted_vertices = mesh_vertices + translation_vector
+
+    centered_mesh = {
+        'vertices': shifted_vertices,
+        'tetrahedra': mesh['tetrahedra'].copy()
+    }
+
+    if 'surface_triangles' in mesh:
+        centered_mesh['surface_triangles'] = mesh['surface_triangles'].copy()
+
+    return centered_mesh
+
+def isomorph_Maybe(mesh, canonical_image, individual_image, transforms_dir, bone_name, iteration, debug_dir=None):
+    """
+    Morphs the canonical mesh using Normalized Convolution to smooth the
+    B-spline deformation field. This prevents tetrahedra from folding while
+    guaranteeing the boundary vectors do not shrink or pull off-center.
+    """
+    logging.info(f"Morphing canonical mesh to {bone_name} space...")
 
     bspline_transform = find_transforms_for_bone(
         transforms_dir,
@@ -5329,7 +5416,185 @@ def isomorph(mesh, canonical_image, individual_image, transforms_dir, bone_name,
         iteration
     )
 
-    # mesh = align_mesh_to_image(mesh, canonical_image, output_dir = "B:/")
+    if bspline_transform is None:
+        logging.error("Morphing failed: Transform is missing.")
+        return None
+
+    # 1. Convert raw B-spline to a continuous displacement field
+    displacement_field = sitk.TransformToDisplacementField(
+        bspline_transform,
+        sitk.sitkVectorFloat64,
+        canonical_image.GetSize(),
+        canonical_image.GetOrigin(),
+        canonical_image.GetSpacing(),
+        canonical_image.GetDirection()
+    )
+
+    # 2. Create the confidence mask (1 inside the bone, 0 outside)
+    # We dilate it slightly (by 2 voxels) so the mesh boundaries are fully engulfed
+    mask = sitk.Cast(canonical_image > 0, sitk.sitkUInt8)
+    mask = sitk.BinaryDilate(mask, [2, 2, 2], sitk.sitkBall)
+    mask_float = sitk.Cast(mask, sitk.sitkFloat64)
+
+    # 3. Apply Normalized Convolution Smoothing
+    sigma = 1.5
+    smoothed_mask = sitk.SmoothingRecursiveGaussian(mask_float, sigma)
+
+    # --- THE FIX: Force the Gaussian output to 64-bit float ---
+    smoothed_mask = sitk.Cast(smoothed_mask, sitk.sitkFloat64)
+    # ----------------------------------------------------------
+
+    # Create a safe denominator to prevent division by zero in empty space
+    condition_float = sitk.Cast(smoothed_mask > 0.001, sitk.sitkFloat64)
+    not_condition_float = sitk.Cast(smoothed_mask <= 0.001, sitk.sitkFloat64)
+    safe_mask = condition_float * smoothed_mask + not_condition_float
+
+    smoothed_components = []
+    for i in range(3):
+        comp = sitk.VectorIndexSelectionCast(displacement_field, i)
+
+        # Mask the component to ignore the zero-displacement background
+        masked_comp = comp * mask_float
+
+        # Smooth the masked component
+        smoothed_comp = sitk.SmoothingRecursiveGaussian(masked_comp, sigma)
+
+        # Force the smoothed component to 64-bit float before division
+        smoothed_comp = sitk.Cast(smoothed_comp, sitk.sitkFloat64)
+
+        # Normalize to restore true magnitude at the boundaries
+        corrected_comp = smoothed_comp / safe_mask
+        smoothed_components.append(corrected_comp)
+
+    # Compose the corrected displacement field
+    smoothed_field = sitk.Compose(smoothed_components)
+    smooth_transform = sitk.DisplacementFieldTransform(smoothed_field)
+
+    # 4. Apply the perfect, relaxed morph to the mesh vertices
+    logging.info("Warping mesh vertices...")
+    morphed_vertices = []
+    for vertex in mesh['vertices']:
+        transformed_pt = smooth_transform.TransformPoint(vertex.tolist())
+        morphed_vertices.append(transformed_pt)
+
+    morphed_mesh = {
+        'vertices': np.array(morphed_vertices),
+        'tetrahedra': mesh['tetrahedra'].copy()
+    }
+
+    # Preserve surface triangles if they exist
+    if 'surface_triangles' in mesh:
+        morphed_mesh['surface_triangles'] = mesh['surface_triangles'].copy()
+
+    logging.info("Mesh morphing completed successfully.")
+    return morphed_mesh
+
+def isomorph(mesh, canonical_image, individual_image, transforms_dir, bone_name, iteration, debug_dir=None):
+    """
+    Morphs the canonical mesh to the individual trabecular space.
+    Uses smoothed displacement fields to prevent mesh tearing and non-diffeomorphic folding.
+    """
+    logging.info(f"Morphing canonical mesh to {bone_name} space...")
+
+    bspline_transform = find_transforms_for_bone(
+        transforms_dir,
+        bone_name,
+        iteration
+    )
+
+    if bspline_transform is None:
+        logging.error("Morphing failed: Transform is missing.")
+        return None
+
+    # Convert the raw B-spline to a Continuous Displacement Field
+    displacement_field = sitk.TransformToDisplacementField(
+        bspline_transform,
+        sitk.sitkVectorFloat64,
+        canonical_image.GetSize(),
+        canonical_image.GetOrigin(),
+        canonical_image.GetSpacing(),
+        canonical_image.GetDirection()
+    )
+
+    # Gaussian Smoothing
+    displacement_components = [sitk.VectorIndexSelectionCast(displacement_field, i) for i in range(3)]
+
+    smoothed_components = []
+    for comp in displacement_components:
+        # A sigma of 1.5 is the sweet spot for relaxing trabecular deformations
+        smoothed = sitk.SmoothingRecursiveGaussian(comp, 1.5)
+        smoothed_components.append(sitk.Cast(smoothed, sitk.sitkFloat64))
+
+    smoothed_field = sitk.Compose(smoothed_components)
+
+    # Create the smooth Forward transform. (DO NOT INVERT)
+    smooth_transform = sitk.DisplacementFieldTransform(smoothed_field)
+
+    # Apply the relaxed, accurate morph to the mesh vertices
+    morphed_vertices = []
+    for vertex in mesh['vertices']:
+        transformed_pt = smooth_transform.TransformPoint(vertex.tolist())
+        morphed_vertices.append(transformed_pt)
+
+    morphed_mesh = {
+        'vertices': np.array(morphed_vertices),
+        'tetrahedra': mesh['tetrahedra'].copy()
+    }
+
+    # Preserve surface triangles if they exist
+    if 'surface_triangles' in mesh:
+        morphed_mesh['surface_triangles'] = mesh['surface_triangles'].copy()
+
+    morphed_mesh = center_mesh_to_image(morphed_mesh, individual_image)
+
+    logging.info(f"Isotopological Mesh Created Successfully for {bone_name}.")
+    return morphed_mesh
+
+def isomorph1(mesh, canonical_image, individual_image, transforms_dir, bone_name, iteration, debug_dir=None):
+    """
+    Morphs the canonical mesh to the individual trabecular space by directly
+    applying the ITK B-spline transform without backwards inversion.
+    """
+    logging.info(f"Morphing canonical mesh to {bone_name} space...")
+
+    bspline_transform = find_transforms_for_bone(
+        transforms_dir,
+        bone_name,
+        iteration
+    )
+
+    if bspline_transform is None:
+        logging.error("Morphing failed: Transformation file is missing.")
+        return None
+
+    morphed_vertices = []
+
+    for vertex in mesh['vertices']:
+        # TransformPoint expects physical coordinates (which the vertices already are)
+        transformed_pt = bspline_transform.TransformPoint(vertex.tolist())
+        morphed_vertices.append(transformed_pt)
+
+    morphed_mesh = {
+        'vertices': np.array(morphed_vertices),
+        'tetrahedra': mesh['tetrahedra'].copy()
+    }
+
+    # (Optional) Keep any surface triangles if they exist in the mesh dictionary
+    if 'surface_triangles' in mesh:
+        morphed_mesh['surface_triangles'] = mesh['surface_triangles'].copy()
+
+    logging.info("Isotopological Mesh Creation Completed Successfully.")
+    return morphed_mesh
+
+
+def isomorph2(mesh, canonical_image, individual_image, transforms_dir, bone_name, iteration, debug_dir=None):
+    """Enhanced function to morph canonical mesh to individual trabecular space."""
+
+    bspline_transform = find_transforms_for_bone(
+        transforms_dir,
+        bone_name,
+        iteration
+    )
 
     displacement_field = sitk.TransformToDisplacementField(
         bspline_transform,
@@ -5431,7 +5696,6 @@ def hma(trabecular_image, mesh, grid_spacing=2.5, sphere_diameter=5.0, output_di
                     grid_points.append([x, y, z])
 
         grid_points = np.array(grid_points)
-        logging.info(f"Created background grid with {len(grid_points)} points")
 
         # Convert image to numpy array
         np_array = sitk.GetArrayFromImage(trabecular_image)
@@ -5451,9 +5715,6 @@ def hma(trabecular_image, mesh, grid_spacing=2.5, sphere_diameter=5.0, output_di
         for batch in range(num_batches):
             start_idx = batch * batch_size
             end_idx = min((batch + 1) * batch_size, len(grid_points))
-
-            if batch % 10 == 0:
-                logging.info(f"Processing grid batch {batch + 1}/{num_batches}")
 
             for i in range(start_idx, end_idx):
                 point = grid_points[i]
@@ -5532,9 +5793,6 @@ def hma(trabecular_image, mesh, grid_spacing=2.5, sphere_diameter=5.0, output_di
         for batch in range(num_batches):
             start_idx = batch * vertex_batch_size
             end_idx = min((batch + 1) * vertex_batch_size, len(mesh_vertices))
-
-            if batch % 5 == 0:
-                logging.info(f"Processing vertex batch {batch + 1}/{num_batches}")
 
             batch_vertices = mesh_vertices[start_idx:end_idx]
 
@@ -5884,9 +6142,6 @@ def calculate_bvtv_and_anisotropy_at_grid_points(trabecular_image, grid_points, 
             start_idx = batch_idx * batch_size
             end_idx = min((batch_idx + 1) * batch_size, len(grid_points))
 
-            if batch_idx % 10 == 0:
-                logging.info(f"Processing grid batch {batch_idx + 1}/{total_batches}")
-
             for i in range(start_idx, end_idx):
                 point = grid_points[i]
 
@@ -6152,9 +6407,6 @@ def interpolate_values_to_mesh(grid_points, grid_values, mesh_vertices, k=8):
         for batch_idx in range(total_batches):
             start_idx = batch_idx * batch_size
             end_idx = min((batch_idx + 1) * batch_size, len(mesh_vertices))
-
-            if batch_idx % 5 == 0:
-                logging.info(f"Processing vertex batch {batch_idx + 1}/{total_batches}")
 
             batch_vertices = mesh_vertices[start_idx:end_idx]
 
@@ -6713,6 +6965,62 @@ def save_mean_fabric_tensors(results_dict, output_path):
         return False
 
 
+def align_image_to_mesh(image, mesh):
+    """
+    Calculates the spatial offset between the geometric center of a morphed mesh
+    and the bounding-box center of a trabecular image, and translates the image
+    stack to perfectly align with the mesh.
+    """
+    logging.info("Aligning individual trabecular image to the morphed mesh...")
+
+    # 1. Find the physical center of the bone in the image
+    array = sitk.GetArrayFromImage(image)
+    if np.sum(array) == 0:
+        logging.warning("Image is empty. Skipping alignment.")
+        return image
+
+    indices = np.nonzero(array)
+    z_min, y_min, x_min = np.min(indices, axis=1)
+    z_max, y_max, x_max = np.max(indices, axis=1)
+
+    spacing = image.GetSpacing()
+    origin = image.GetOrigin()
+
+    image_center = [
+        origin[0] + ((x_min + x_max) / 2.0) * spacing[0],
+        origin[1] + ((y_min + y_max) / 2.0) * spacing[1],
+        origin[2] + ((z_min + z_max) / 2.0) * spacing[2]
+    ]
+
+    # 2. Find the geometric center of the morphed mesh
+    mesh_vertices = mesh['vertices']
+    mesh_min = np.min(mesh_vertices, axis=0)
+    mesh_max = np.max(mesh_vertices, axis=0)
+    mesh_center = (mesh_min + mesh_max) / 2.0
+
+    # 3. Calculate translation vector (Image -> Mesh)
+    translation_vector = np.array(mesh_center) - np.array(image_center)
+
+    # SimpleITK Resample maps points from the Output space back to the Input space.
+    # Therefore, to shift an image by +V, the transform offset must be inverted (-V).
+    transform_offset = -translation_vector
+    translation_transform = sitk.TranslationTransform(3)
+    translation_transform.SetOffset(transform_offset.tolist())
+
+    # 4. Resample the image to its new physical location
+    aligned_image = sitk.Resample(
+        image,
+        image, # Keep the exact same grid dimensions
+        translation_transform,
+        sitk.sitkNearestNeighbor, # Prevents blurring of binary mask
+        0.0,
+        image.GetPixelID()
+    )
+
+    logging.info(f"Image translated to perfectly engulf mesh by: {translation_vector}")
+    return aligned_image
+
+
 def isoHMA(input_dir, output_dir, iteration=2, cores='detect', reference="reference", method="chma"):
     """
     Execute Step B of the cHMA workflow: Create a canonical mesh and perform analyses.
@@ -6740,7 +7048,7 @@ def isoHMA(input_dir, output_dir, iteration=2, cores='detect', reference="refere
 
     # Start Logging Progress
     start_time = time.time()
-    logging.info(f"Starting cHMA analysis - Input: {input_dir}, Output: {output_dir}")
+    logging.info(f"Starting isoHMA analysis - Input: {input_dir}, Output: {output_dir}")
 
     # Set the number of threads for SimpleITK
     if cores == 'detect':
@@ -6985,7 +7293,6 @@ def isoHMA(input_dir, output_dir, iteration=2, cores='detect', reference="refere
                 logging.info(f"Processing {bone}...")
 
                 if method == "chma":
-
                     # Find trabecular image
                     trab_path = os.path.join(trab_dir, f"{bone}.tiff")
                     if not os.path.exists(trab_path):
@@ -6996,6 +7303,21 @@ def isoHMA(input_dir, output_dir, iteration=2, cores='detect', reference="refere
 
                     # Load trabecular image
                     trab_image = load_image(trab_path)
+
+                    # Save similarity transform
+                    transform_path = os.path.join(input_dir,
+                                                  "Similarity_Transform",
+                                                  "Transforms2",
+                                                  f"{bone}_iter{iteration}.tfm"
+                                                  )
+
+                    similarity_transform = sitk.ReadTransform(transform_path)
+
+                    trab_image = apply_transform(
+                        trab_image,
+                        similarity_transform,
+                        canonical_bone
+                    )
 
                     # Morph canonical mesh to individual trabecular space
                     morphed_mesh = isomorph(
@@ -7008,7 +7330,7 @@ def isoHMA(input_dir, output_dir, iteration=2, cores='detect', reference="refere
                         debug_dir=os.path.join(output_dir, "Debug")
                     )
 
-                else:
+                elif method == "schma":
                     # Find trabecular image
                     trab_path = os.path.join(input_dir, "BSpline_Transform", "Trabecular", f"{bone}.tiff")
                     if not os.path.exists(trab_path):
@@ -7019,9 +7341,8 @@ def isoHMA(input_dir, output_dir, iteration=2, cores='detect', reference="refere
 
                     trab_image = load_image(trab_path)
 
-                    morphed_mesh = align_mesh_to_image(
-                        morphed_mesh,
-                        trab_image
+                    morphed_mesh = align_image_to_mesh(
+                        trab_image, morphed_mesh
                     )
 
                 if morphed_mesh is None:
@@ -7097,7 +7418,7 @@ def isoHMA(input_dir, output_dir, iteration=2, cores='detect', reference="refere
         # Calculate total runtime
         end_time = time.time()
         total_time = end_time - start_time
-        logging.info(f"cHMA analysis completed in {total_time / 60:.2f} minutes")
+        logging.info(f"isoHMA analysis completed in {total_time / 60:.2f} minutes")
         gc.collect()
 
         return True
