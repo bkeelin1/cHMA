@@ -214,7 +214,7 @@ def Segment(input_dir, output_dir):
         Path to input tiff image stack (as a singular file, not a list of images)
     output_dir : str
         Output Path to put segmented tiff image stacks (as a singular file, not a list of images)
-    """
+
     Returns:
     --------
         This function creates 4 folders: Cortical (Cortical Bone shell), Filled (Binary trabecular+cortical bone), Trabecular (Trabecular Bone), and Raw (original tiff files).
